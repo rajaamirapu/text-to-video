@@ -306,11 +306,15 @@ def step_predownload_sd(model_id: str = SD_MODEL_ID, skip: bool = False):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse, shutil
+    import argparse
     parser = argparse.ArgumentParser(description="Set up Text-to-Video models")
     parser.add_argument(
         "--skip-sd", action="store_true",
         help="Skip Stable Diffusion pre-download (downloads on first run instead)"
+    )
+    parser.add_argument(
+        "--skip-weights", action="store_true",
+        help="Skip Wav2Lip weight download (use if you already ran download_weights.py)"
     )
     parser.add_argument(
         "--sd-model", default=SD_MODEL_ID,
@@ -326,7 +330,13 @@ def main():
 
     step_clone_wav2lip()
     step_install_wav2lip_deps()
-    step_download_wav2lip_weights()
+
+    if args.skip_weights:
+        print("\n  [3/5] Wav2Lip weights — skipped (--skip-weights)")
+        print("        Run  python download_weights.py  if weights are missing.")
+    else:
+        step_download_wav2lip_weights()
+
     step_download_face_detection()
     step_predownload_sd(args.sd_model, skip=args.skip_sd)
 
