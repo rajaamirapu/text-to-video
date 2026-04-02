@@ -1,20 +1,35 @@
 # ── Core ──────────────────────────────────────────────────────────────────────
-Pillow>=10.0.0           # PIL – portrait rendering
-moviepy>=1.0.3           # video composition
+Pillow>=10.0.0
+moviepy>=1.0.3
 numpy>=1.24.0
-
-# ── Audio / TTS ────────────────────────────────────────────────────────────────
-gTTS>=2.3.2              # Google Text-to-Speech (requires internet)
-pyttsx3>=2.90            # offline TTS fallback
-librosa>=0.10.0          # audio analysis for lip-sync
-soundfile>=0.12.1        # audio I/O fallback
-
-# ── Lip-sync smoothing ────────────────────────────────────────────────────────
-scipy>=1.11.0
-
-# ── Ollama HTTP client ─────────────────────────────────────────────────────────
 requests>=2.31.0
 
-# ── Optional / convenience ────────────────────────────────────────────────────
-# imageio>=2.31.0        # alternate video backend (moviepy can use it)
-# ffmpeg-python          # if you need direct ffmpeg access
+# ── Stable Diffusion (face generation, GPU) ───────────────────────────────────
+diffusers>=0.27.0
+transformers>=4.38.0
+accelerate>=0.27.0
+xformers                  # optional: memory-efficient attention on NVIDIA GPUs
+
+# NOTE: Install PyTorch separately for your CUDA version, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# See: https://pytorch.org/get-started/locally/
+
+# ── Audio / TTS ────────────────────────────────────────────────────────────────
+gTTS>=2.3.2               # Google TTS (requires internet)
+pyttsx3>=2.90             # offline TTS fallback
+librosa>=0.10.0           # audio analysis for lip-sync
+soundfile>=0.12.1         # audio I/O fallback
+
+# ── Lip-sync signal processing ────────────────────────────────────────────────
+scipy>=1.11.0
+
+# ── Wav2Lip model download ────────────────────────────────────────────────────
+gdown>=4.7.1              # Google Drive model downloader (used by setup_models.py)
+tqdm>=4.65.0
+
+# ── Ollama HTTP client ─────────────────────────────────────────────────────────
+# (uses built-in requests — no extra package needed)
+
+# ── Wav2Lip native dependencies (installed via Wav2Lip/requirements.txt) ───────
+# librosa, numpy, opencv-python, torch, batch_face_detection, etc.
+# These are handled automatically by setup_models.py
