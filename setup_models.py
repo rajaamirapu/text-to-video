@@ -19,6 +19,7 @@ After this script completes, run:
 
 from __future__ import annotations
 import os
+import shutil
 import subprocess
 import sys
 
@@ -103,26 +104,137 @@ def step_download_wav2lip_weights():
     gan_path = os.path.join(checkpoints_dir, "wav2lip_gan.pth")
     std_path = os.path.join(checkpoints_dir, "wav2lip.pth")
 
-    import importlib.util
-    has_gdown = importlib.util.find_spec("gdown") is not None
-    if not has_gdown:
-        pip_install("gdown")
-
-    import gdown  # type: ignore
-
-    if not os.path.isfile(gan_path):
-        print("  Downloading wav2lip_gan.pth (~420 MB) …")
-        gdown.download(id=WAV2LIP_GAN_GDRIVE_ID, output=gan_path, quiet=False)
-    else:
-        print(f"  ✓ {gan_path} already exists")
-
-    if not os.path.isfile(std_path):
-        print("  Downloading wav2lip.pth (~420 MB) …")
-        gdown.download(id=WAV2LIP_GDRIVE_ID, output=std_path, quiet=False)
-    else:
-        print(f"  ✓ {std_path} already exists")
-
+    _download_weight(
+        name="wav2lip_gan.pth",
+        dest=gan_path,
+        gdrive_id=WAV2LIP_GAN_GDRIVE_ID,
+        gdrive_share_url=f"https://drive.google.com/file/d/{WAV2LIP_GAN_GDRIVE_ID}/view?usp=sharing",
+    )
+    _download_weight(
+        name="wav2lip.pth",
+        dest=std_path,
+        gdrive_id=WAV2LIP_GDRIVE_ID,
+        gdrive_share_url=f"https://drive.google.com/file/d/{WAV2LIP_GDRIVE_ID}/view?usp=sharing",
+    )
     print("  ✓ Wav2Lip weights ready")
+
+
+def _download_weight(name: str, dest: str, gdrive_id: str, gdrive_share_url: str):
+    """
+    Try multiple strategies to download a Wav2Lip model weight file.
+    Falls back to clear manual instructions if all automated methods fail.
+    """
+    if os.path.isfile(dest) and os.path.getsize(dest) > 1_000_000:
+        print(f"  ✓ {name} already present  ({os.path.getsize(dest) // (1024*1024)} MB)")
+        return
+
+    print(f"\n  Downloading {name} …")
+    downloaded = False
+
+    # ── Method 1: gdown fuzzy (handles virus-scan redirect) ──────────────────
+    try:
+        import gdown  # type: ignore
+        print("  [1/3] Trying gdown (fuzzy mode) …")
+        gdown.download(gdrive_share_url, dest, quiet=False, fuzzy=True)
+        if os.path.isfile(dest) and os.path.getsize(dest) > 1_000_000:
+            print(f"  ✓ {name} downloaded via Google Drive")
+            downloaded = True
+    except Exception as e:
+        print(f"  [1/3] gdown failed: {type(e).__name__}: {str(e)[:120]}")
+
+    # ── Method 2: requests + manual cookie bypass ─────────────────────────────
+    if not downloaded:
+        print("  [2/3] Trying requests with cookie bypass …")
+        try:
+            import requests as _req
+            session = _req.Session()
+            direct  = f"https://drive.google.com/uc?export=download&id={gdrive_id}"
+            r = session.get(direct, stream=True, timeout=30)
+
+            # Google shows a confirm page for large files — find the token
+            confirm_token = None
+            for k, v in r.cookies.items():
+                if k.startswith("download_warning"):
+                    confirm_token = v
+                    break
+            # Also search HTML for confirm token
+            if not confirm_token and "confirm" in r.text:
+                import re
+                m = re.search(r'confirm=([0-9A-Za-z_]+)', r.text)
+                if m:
+                    confirm_token = m.group(1)
+
+            if confirm_token:
+                url2 = f"{direct}&confirm={confirm_token}"
+                r = session.get(url2, stream=True, timeout=60)
+
+            # Stream to disk
+            total = int(r.headers.get("content-length", 0))
+            done  = 0
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(32768):
+                    if chunk:
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            print(f"    {done*100//total}%  ({done//(1024*1024)} MB)",
+                                  end="\r", flush=True)
+            print()
+            if os.path.isfile(dest) and os.path.getsize(dest) > 1_000_000:
+                print(f"  ✓ {name} downloaded via requests")
+                downloaded = True
+            else:
+                os.unlink(dest)   # remove partial/HTML stub
+        except Exception as e:
+            print(f"  [2/3] requests failed: {e}")
+
+    # ── Method 3: wget with cookies ───────────────────────────────────────────
+    if not downloaded and shutil.which("wget"):
+        print("  [3/3] Trying wget …")
+        try:
+            cookie_jar = dest + ".cookies"
+            # Step 1: get confirmation cookie
+            subprocess.run([
+                "wget", "--quiet", "--save-cookies", cookie_jar,
+                "--keep-session-cookies", "--no-check-certificate",
+                f"https://drive.google.com/uc?export=download&id={gdrive_id}",
+                "-O", "/dev/null",
+            ], check=True)
+            # Step 2: actual download
+            subprocess.run([
+                "wget", "--load-cookies", cookie_jar,
+                "--no-check-certificate", "--content-disposition",
+                f"https://drive.google.com/uc?export=download&confirm=t&id={gdrive_id}",
+                "-O", dest,
+            ], check=True)
+            if os.path.isfile(cookie_jar):
+                os.unlink(cookie_jar)
+            if os.path.isfile(dest) and os.path.getsize(dest) > 1_000_000:
+                print(f"  ✓ {name} downloaded via wget")
+                downloaded = True
+        except Exception as e:
+            print(f"  [3/3] wget failed: {e}")
+
+    # ── All automated methods failed — clear manual instructions ──────────────
+    if not downloaded:
+        abs_dest = os.path.abspath(dest)
+        print(f"""
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ⚠  MANUAL DOWNLOAD NEEDED: {name:<35}│
+  ├─────────────────────────────────────────────────────────────────┤
+  │  Google Drive is rate-limiting automated downloads.             │
+  │                                                                 │
+  │  Step 1 — Open this link in your browser:                       │
+  │  {gdrive_share_url:<65}│
+  │                                                                 │
+  │  Step 2 — Click "Download anyway" if Google warns about size.   │
+  │                                                                 │
+  │  Step 3 — Move the downloaded file here:                        │
+  │  {abs_dest:<65}│
+  │                                                                 │
+  │  Then re-run:  python setup_models.py                           │
+  └─────────────────────────────────────────────────────────────────┘
+""")
 
 
 def step_download_face_detection():
