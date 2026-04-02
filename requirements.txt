@@ -1,0 +1,20 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+Pillow>=10.0.0           # PIL – portrait rendering
+moviepy>=1.0.3           # video composition
+numpy>=1.24.0
+
+# ── Audio / TTS ────────────────────────────────────────────────────────────────
+gTTS>=2.3.2              # Google Text-to-Speech (requires internet)
+pyttsx3>=2.90            # offline TTS fallback
+librosa>=0.10.0          # audio analysis for lip-sync
+soundfile>=0.12.1        # audio I/O fallback
+
+# ── Lip-sync smoothing ────────────────────────────────────────────────────────
+scipy>=1.11.0
+
+# ── Ollama HTTP client ─────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Optional / convenience ────────────────────────────────────────────────────
+# imageio>=2.31.0        # alternate video backend (moviepy can use it)
+# ffmpeg-python          # if you need direct ffmpeg access
