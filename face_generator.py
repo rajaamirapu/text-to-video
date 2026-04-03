@@ -1,18 +1,20 @@
 """
 face_generator.py
 
-Generates character portrait images using Ollama.
+Generates realistic character portrait images.
 
 Strategy (tried in order)
 --------------------------
 1. Ollama image generation  — POST /api/generate → response.images[]
    Works if the user has a model with image-output capability installed
-   (e.g. a GGUF Stable-Diffusion model loaded via Ollama).
+   (e.g. a FLUX or SD GGUF model loaded via Ollama).
 
-2. Ollama + enhanced PIL    — LLM describes appearance in structured JSON,
-   PIL renders a photorealistic-style portrait using those exact colours,
-   proportions, and style attributes. Always works regardless of which
-   Ollama model is installed.
+2. Pollinations.ai (free, no API key) — sends a detailed prompt to
+   https://image.pollinations.ai and receives a photorealistic JPEG.
+   Requires an internet connection. Powered by FLUX.
+
+3. Enhanced PIL fallback — always works offline, produces a stylised
+   portrait driven by Ollama appearance colours.
 
 No diffusers / HuggingFace / Stable Diffusion dependency required.
 """
@@ -20,11 +22,9 @@ No diffusers / HuggingFace / Stable Diffusion dependency required.
 from __future__ import annotations
 import base64
 import io
-import json
-import math
 import os
 import random
-import sys
+import urllib.parse
 from typing import Optional
 
 import requests
@@ -32,7 +32,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 1 ── Ollama image-generation attempt
+# Section 1 ── Ollama image-generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _try_ollama_image_gen(
@@ -42,10 +42,7 @@ def _try_ollama_image_gen(
     width: int,
     height: int,
 ) -> Optional[Image.Image]:
-    """
-    Ask Ollama to generate an image.
-    Returns a PIL Image if the model supports image output, else None.
-    """
+    """Ask Ollama to generate an image. Returns PIL Image or None."""
     try:
         payload = {
             "model": model,
@@ -53,72 +50,120 @@ def _try_ollama_image_gen(
             "stream": False,
             "options": {"num_predict": -1},
         }
-        r = requests.post(
-            f"{ollama_url}/api/generate",
-            json=payload,
-            timeout=120,
-        )
+        r = requests.post(f"{ollama_url}/api/generate", json=payload, timeout=120)
         r.raise_for_status()
         data = r.json()
-
         raw_images = data.get("images") or []
         if raw_images:
             img_bytes = base64.b64decode(raw_images[0])
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             img = img.resize((width, height), Image.LANCZOS)
-            print(f"  [Ollama] Image generated via model '{model}'")
+            print(f"  [FaceGen] Ollama image generated via model '{model}'")
             return img
-
-    except Exception as e:
-        pass   # model doesn't support image output — fall through to PIL
-
+    except Exception:
+        pass
     return None
 
 
-def _build_image_prompt(name: str, role: str, gender: str, appearance: dict) -> str:
-    """Build a detailed portrait prompt from appearance data."""
-    sk = appearance.get("skin_rgb", [220, 185, 155])
-    hr = appearance.get("hair_rgb", [80, 50, 20])
-    ey = appearance.get("eye_rgb", [70, 130, 180])
-    style = appearance.get("hair_style", "medium")
-    skin_word = "fair" if sk[0] > 210 else "medium" if sk[0] > 170 else "dark"
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 2 ── Pollinations.ai (free, photorealistic FLUX images)
+# ─────────────────────────────────────────────────────────────────────────────
+
+POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
+
+
+def _try_pollinations(
+    prompt: str,
+    width: int,
+    height: int,
+    seed: int = 42,
+    timeout: int = 60,
+) -> Optional[Image.Image]:
+    """
+    Fetch a photorealistic image from Pollinations.ai (free, no API key).
+    Returns a PIL Image on success, None on any error.
+    """
+    encoded = urllib.parse.quote(prompt)
+    url = (
+        f"{POLLINATIONS_BASE}/{encoded}"
+        f"?width={width}&height={height}&seed={seed}"
+        f"&model=flux&nologo=true&enhance=true"
+    )
+    try:
+        print(f"  [FaceGen] Requesting photorealistic portrait from Pollinations.ai …")
+        r = requests.get(url, timeout=timeout, stream=True)
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "")
+        if "image" not in content_type:
+            return None
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        if img.size[0] < 64:          # suspiciously small → probably an error page
+            return None
+        img = img.resize((width, height), Image.LANCZOS)
+        print(f"  [FaceGen] ✓ Photorealistic portrait received ({img.size[0]}×{img.size[1]})")
+        return img
+    except Exception as e:
+        print(f"  [FaceGen] Pollinations.ai unavailable ({e}) — using PIL portrait")
+        return None
+
+
+def _build_portrait_prompt(name: str, role: str, gender: str, appearance: dict, seed: int) -> str:
+    """Build a rich photorealistic prompt from appearance data."""
+    sk    = appearance.get("skin_rgb",  [220, 185, 155])
+    hr    = appearance.get("hair_rgb",  [80,  50,  20])
+    ey    = appearance.get("eye_rgb",   [70, 130, 180])
+    style = appearance.get("hair_style", "medium length")
+
+    skin_word = (
+        "fair, light" if sk[0] > 210 else
+        "medium, warm" if sk[0] > 175 else
+        "olive, tan" if sk[0] > 140 else
+        "deep brown, dark"
+    )
+    hair_hex  = "#{:02x}{:02x}{:02x}".format(*[int(c) for c in hr])
+    eye_color = _rgb_to_color_word(ey)
+
     return (
-        f"photorealistic portrait headshot of {name}, a {gender} {role}, "
-        f"{skin_word} skin, {style} hair with rgb({hr[0]},{hr[1]},{hr[2]}) colour, "
-        f"rgb({ey[0]},{ey[1]},{ey[2]}) eyes, professional attire, "
-        f"natural studio lighting, high detail, 4K, sharp focus, "
-        f"facing the camera, neutral background"
+        f"professional headshot portrait photograph of a real {gender} {role} named {name}, "
+        f"{skin_word} skin tone, {style} hair in shade {hair_hex}, {eye_color} eyes, "
+        f"neutral expression, business casual attire, "
+        f"soft studio lighting, shallow depth of field, "
+        f"sharp focus on face, photorealistic, 8K, DSLR quality, "
+        f"plain light grey background, facing camera directly, "
+        f"no makeup excess, natural appearance, seed {seed}"
     )
 
 
+def _rgb_to_color_word(rgb) -> str:
+    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+    if r > 150 and g > 150 and b > 150:
+        return "light grey"
+    if b > r and b > g:
+        return "blue" if b > 150 else "dark blue"
+    if g > r and g > b:
+        return "green"
+    if r > g and r > b:
+        return "brown" if r < 160 else "hazel"
+    return "dark brown"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 2 ── Enhanced PIL portrait renderer (Ollama-driven colours)
+# Section 3 ── PIL fallback portrait renderer
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _lerp(a: tuple, b: tuple, t: float) -> tuple:
+def _lerp(a, b, t):
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(len(a)))
 
-
 def _clamp(v, lo=0, hi=255):
-    return max(lo, min(hi, v))
-
+    return max(lo, min(hi, int(v)))
 
 def _darken(rgb, amt=30):
     return tuple(_clamp(c - amt) for c in rgb)
 
-
 def _lighten(rgb, amt=30):
     return tuple(_clamp(c + amt) for c in rgb)
 
-
-def _draw_gradient_ellipse(
-    img: Image.Image,
-    bbox: tuple,
-    color_centre: tuple,
-    color_edge: tuple,
-    steps: int = 20,
-):
-    """Fill an ellipse with a radial gradient for skin-depth effect."""
+def _draw_gradient_ellipse(img, bbox, color_centre, color_edge, steps=20):
     draw = ImageDraw.Draw(img)
     x0, y0, x1, y1 = bbox
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
@@ -128,45 +173,31 @@ def _draw_gradient_ellipse(
         col = _lerp(color_centre, color_edge, t)
         sx  = rx * i / steps
         sy  = ry * i / steps
-        draw.ellipse(
-            [cx - sx, cy - sy, cx + sx, cy + sy],
-            fill=col,
-        )
+        draw.ellipse([cx - sx, cy - sy, cx + sx, cy + sy], fill=col)
 
 
-def _render_portrait(
-    width: int,
-    height: int,
-    appearance: dict,
-    name: str,
-    position: str = "left",
-) -> Image.Image:
-    """
-    Render a photorealistic-style portrait bust using PIL.
-    Colours are driven by Ollama's appearance JSON.
-    """
-    skin   = tuple(appearance.get("skin_rgb",  [220, 185, 155]))
-    hair   = tuple(appearance.get("hair_rgb",  [60,  40,  20]))
-    eye    = tuple(appearance.get("eye_rgb",   [70, 130, 180]))
-    shirt  = tuple(appearance.get("shirt_rgb", [70, 100, 160]))
-    style  = appearance.get("hair_style", "medium")
-    gender = appearance.get("gender", "neutral")
+def _render_portrait(width, height, appearance, name, position="left"):
+    """Stylised PIL fallback — used only when all AI options are unavailable."""
+    skin  = tuple(appearance.get("skin_rgb",  [220, 185, 155]))
+    hair  = tuple(appearance.get("hair_rgb",  [60,  40,  20]))
+    eye   = tuple(appearance.get("eye_rgb",   [70, 130, 180]))
+    shirt = tuple(appearance.get("shirt_rgb", [70, 100, 160]))
+    style = appearance.get("hair_style", "medium")
 
     img  = Image.new("RGB", (width, height), (24, 28, 38))
     draw = ImageDraw.Draw(img)
-
     cx   = width  // 2
     head_r  = int(min(width, height) * 0.22)
     head_cy = int(height * 0.36)
     head_cx = cx
 
-    # ── background gradient ──────────────────────────────────────────────────
+    # background gradient
     for y in range(height):
         t   = y / height
         col = _lerp((38, 44, 58), (18, 22, 32), t)
         draw.line([(0, y), (width, y)], fill=col)
 
-    # ── body / shirt ─────────────────────────────────────────────────────────
+    # body / shirt
     body_top = head_cy + int(head_r * 1.05)
     sw = int(head_r * 2.0)
     body_pts = [
@@ -176,27 +207,22 @@ def _render_portrait(
         (cx - int(sw * 1.5), height + 10),
     ]
     draw.polygon(body_pts, fill=shirt)
-    # shirt highlight
     draw.polygon(body_pts, outline=_lighten(shirt, 20))
-    # collar
-    draw.line([(cx - 18, body_top), (cx,  body_top + 40)], fill=_lighten(shirt, 40), width=2)
-    draw.line([(cx + 18, body_top), (cx,  body_top + 40)], fill=_lighten(shirt, 40), width=2)
+    draw.line([(cx - 18, body_top), (cx, body_top + 40)], fill=_lighten(shirt, 40), width=2)
+    draw.line([(cx + 18, body_top), (cx, body_top + 40)], fill=_lighten(shirt, 40), width=2)
 
-    # ── neck ─────────────────────────────────────────────────────────────────
+    # neck
     nw = int(head_r * 0.25)
     ny = head_cy + int(head_r * 0.84)
-    _draw_gradient_ellipse(
-        img, [cx - nw, ny, cx + nw, ny + int(head_r * 0.5)],
-        _lighten(skin, 8), _darken(skin, 15),
-    )
+    _draw_gradient_ellipse(img, [cx - nw, ny, cx + nw, ny + int(head_r * 0.5)],
+                           _lighten(skin, 8), _darken(skin, 15))
 
-    # ── hair (behind head) ───────────────────────────────────────────────────
+    # hair (behind)
     _draw_gradient_ellipse(
         img,
         [head_cx - int(head_r * 1.10), head_cy - int(head_r * 1.28),
          head_cx + int(head_r * 1.10), head_cy + int(head_r * 0.32)],
-        _lighten(hair, 15),
-        _darken(hair, 20),
+        _lighten(hair, 15), _darken(hair, 20),
     )
     if style == "long":
         for side in (-1, 1):
@@ -208,39 +234,33 @@ def _render_portrait(
             ]
             draw.polygon(pts, fill=hair)
 
-    # ── head (face) ──────────────────────────────────────────────────────────
+    # face
     _draw_gradient_ellipse(
         img,
         [head_cx - head_r, head_cy - int(head_r * 1.12),
          head_cx + head_r, head_cy + int(head_r * 0.94)],
-        _lighten(skin, 18),
-        _darken(skin, 12),
-        steps=30,
+        _lighten(skin, 18), _darken(skin, 12), steps=30,
     )
 
-    # ── hairline (front) ─────────────────────────────────────────────────────
+    # hairline
     draw.arc(
         [head_cx - int(head_r * 1.08), head_cy - int(head_r * 1.24),
          head_cx + int(head_r * 1.08), head_cy - int(head_r * 0.20)],
-        start=202, end=338,
-        fill=hair,
-        width=int(head_r * 0.30),
+        start=202, end=338, fill=hair, width=int(head_r * 0.30),
     )
 
-    # ── ears ─────────────────────────────────────────────────────────────────
+    # ears
     ear_cy = head_cy - int(head_r * 0.06)
     for side in (-1, 1):
         ex = head_cx + side * int(head_r * 0.88)
         ew, eh = int(head_r * 0.14), int(head_r * 0.20)
         _draw_gradient_ellipse(img, [ex - ew, ear_cy - eh, ex + ew, ear_cy + eh],
                                skin, _darken(skin, 22))
-        draw.ellipse(
-            [ex - int(ew * 0.45), ear_cy - int(eh * 0.45),
-             ex + int(ew * 0.45), ear_cy + int(eh * 0.45)],
-            fill=_darken(skin, 30),
-        )
+        draw.ellipse([ex - int(ew * 0.45), ear_cy - int(eh * 0.45),
+                      ex + int(ew * 0.45), ear_cy + int(eh * 0.45)],
+                     fill=_darken(skin, 30))
 
-    # ── eyebrows ─────────────────────────────────────────────────────────────
+    # eyebrows
     brow_y  = head_cy - int(head_r * 0.30)
     spacing = int(head_r * 0.36)
     brow_w  = int(head_r * 0.25)
@@ -251,144 +271,114 @@ def _render_portrait(
                   bx + brow_w, brow_y + int(head_r * 0.04)],
                  start=208, end=332, fill=brow_col, width=3)
 
-    # ── eyes ─────────────────────────────────────────────────────────────────
-    eye_y   = head_cy - int(head_r * 0.14)
-    ew, eh  = int(head_r * 0.24), int(head_r * 0.15)
+    # eyes
+    eye_y  = head_cy - int(head_r * 0.14)
+    ew, eh = int(head_r * 0.24), int(head_r * 0.15)
     for side in (-1, 1):
         ex = head_cx + side * spacing
-
-        # sclera
         draw.ellipse([ex - ew, eye_y - eh, ex + ew, eye_y + eh], fill=(252, 252, 250))
-        # iris gradient
         ir = int(eh * 0.80)
         _draw_gradient_ellipse(img, [ex - ir, eye_y - ir, ex + ir, eye_y + ir],
                                _lighten(eye, 20), _darken(eye, 10), steps=10)
-        # pupil
         pr = int(ir * 0.46)
         draw.ellipse([ex - pr, eye_y - pr, ex + pr, eye_y + pr], fill=(12, 10, 10))
-        # specular
-        draw.ellipse([ex + 2, eye_y - pr + 1,
-                      ex + int(pr * 0.65) + 2, eye_y],
+        draw.ellipse([ex + 2, eye_y - pr + 1, ex + int(pr * 0.65) + 2, eye_y],
                      fill=(255, 255, 255))
-        # eyelid
         draw.arc([ex - ew, eye_y - eh, ex + ew, eye_y + eh],
                  start=205, end=335, fill=_darken(skin, 50), width=2)
-        # lower lash line
         draw.arc([ex - ew, eye_y - eh, ex + ew, eye_y + eh],
                  start=20, end=160, fill=_darken(skin, 35), width=1)
 
-    # ── nose ─────────────────────────────────────────────────────────────────
+    # nose
     nose_cy = head_cy + int(head_r * 0.12)
-    nw2     = int(head_r * 0.09)
     shadow  = _darken(skin, 28)
     for side in (-1, 1):
-        nx = head_cx + side * int(nw2 * 0.88)
+        nx = head_cx + side * int(head_r * 0.08)
         draw.ellipse([nx - int(head_r * 0.042), nose_cy - int(head_r * 0.030),
                       nx + int(head_r * 0.042), nose_cy + int(head_r * 0.042)],
                      fill=shadow)
-    # bridge shading
-    draw.line(
-        [(head_cx, head_cy - int(head_r * 0.10)), (head_cx, nose_cy + int(head_r * 0.04))],
-        fill=_darken(skin, 18), width=1,
-    )
+    draw.line([(head_cx, head_cy - int(head_r * 0.10)),
+               (head_cx, nose_cy + int(head_r * 0.04))],
+              fill=_darken(skin, 18), width=1)
 
-    # ── mouth ─────────────────────────────────────────────────────────────────
+    # mouth
     mouth_cy = head_cy + int(head_r * 0.42)
     mw       = int(head_r * 0.34)
-    lip_col  = (
-        _clamp(skin[0] + 20),
-        _clamp(skin[1] - 45),
-        _clamp(skin[2] - 45),
-    )
-    # lip shadow
+    lip_col  = (_clamp(skin[0] + 20), _clamp(skin[1] - 45), _clamp(skin[2] - 45))
     draw.ellipse([head_cx - int(mw * 0.6), mouth_cy - 3,
                   head_cx + int(mw * 0.6), mouth_cy + 3],
                  fill=_darken(skin, 22))
-    # smile arc
     draw.arc([head_cx - mw, mouth_cy - int(head_r * 0.06),
               head_cx + mw, mouth_cy + int(head_r * 0.06)],
              start=8, end=172, fill=lip_col, width=3)
-    # lower lip fullness
     draw.arc([head_cx - int(mw * 0.78), mouth_cy,
               head_cx + int(mw * 0.78), mouth_cy + int(head_r * 0.08)],
              start=5, end=175, fill=_lighten(lip_col, 12), width=2)
 
-    # ── subtle skin texture (fine noise) ─────────────────────────────────────
-    # Add a very slight noise layer over the face area for texture
-    face_mask = Image.new("L", (width, height), 0)
-    mask_draw = ImageDraw.Draw(face_mask)
-    mask_draw.ellipse(
-        [head_cx - head_r, head_cy - int(head_r * 1.12),
-         head_cx + head_r, head_cy + int(head_r * 0.94)],
-        fill=255,
-    )
-    rng = random.Random(42)
-    noise = Image.new("RGB", (width, height), (0, 0, 0))
-    noise_pixels = noise.load()
-    for py in range(head_cy - int(head_r * 1.12), head_cy + int(head_r * 0.94)):
-        for px in range(head_cx - head_r, head_cx + head_r):
-            if 0 <= px < width and 0 <= py < height:
-                v = rng.randint(-6, 6)
-                noise_pixels[px, py] = (v, v, v)
-    img = Image.composite(
-        Image.blend(img, Image.eval(img, lambda x: _clamp(x + rng.randint(-4, 4))), 0.3),
-        img,
-        face_mask,
-    )
-
-    # ── name label ────────────────────────────────────────────────────────────
+    # name label
     draw2 = ImageDraw.Draw(img)
     lw, lh = 160, 26
     lx, ly = cx - lw // 2, height - 45
-    draw2.rounded_rectangle([lx, ly, lx + lw, ly + lh], radius=7,
-                             fill=(40, 50, 70, 200))
+    draw2.rounded_rectangle([lx, ly, lx + lw, ly + lh], radius=7, fill=(40, 50, 70))
     draw2.text((cx, ly + lh // 2), name, fill=(210, 220, 240), anchor="mm")
-
-    # Soft vignette
-    img = img.filter(ImageFilter.GaussianBlur(0))
 
     return img
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 3 ── Public API
+# Section 4 ── Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_face_image(
     output_path: str,
-    name: str          = "Person",
-    role: str          = "professional",
-    gender: str        = "female",
-    appearance: dict   | None = None,
-    ollama_url: str    = "http://localhost:11434",
-    ollama_model: str  | None = None,
-    width: int         = 512,
-    height: int        = 512,
-    position: str      = "left",
+    name: str         = "Person",
+    role: str         = "professional",
+    gender: str       = "female",
+    appearance: dict  | None = None,
+    ollama_url: str   = "http://localhost:11434",
+    ollama_model: str | None = None,
+    width: int        = 512,
+    height: int       = 512,
+    position: str     = "left",
+    seed: int         = 42,
+    use_pollinations: bool = True,
 ) -> str:
     """
-    Generate and save a portrait image.
-    Tries Ollama image generation first; falls back to enhanced PIL rendering.
+    Generate and save a realistic portrait image.
+
+    Tries (in order):
+      1. Ollama image-generation model (if ollama_model provided)
+      2. Pollinations.ai free FLUX API  (if use_pollinations=True and internet available)
+      3. Enhanced PIL portrait          (always works, offline)
 
     Returns the saved output_path.
     """
     if appearance is None:
         appearance = {}
 
-    # ── 1. Try Ollama image generation ───────────────────────────────────────
+    prompt = _build_portrait_prompt(name, role, gender, appearance, seed)
+
+    # ── 1. Ollama image gen ───────────────────────────────────────────────────
     if ollama_model:
-        prompt = _build_image_prompt(name, role, gender, appearance)
         img = _try_ollama_image_gen(prompt, ollama_model, ollama_url, width, height)
         if img:
             img.save(output_path)
-            print(f"  [FaceGen] '{name}' saved via Ollama image gen → {output_path}")
+            print(f"  [FaceGen] '{name}' → {output_path}  (Ollama)")
             return output_path
 
-    # ── 2. Enhanced PIL rendering (always works) ──────────────────────────────
-    print(f"  [FaceGen] Rendering '{name}' portrait with PIL (Ollama-driven colours)")
+    # ── 2. Pollinations.ai (photorealistic FLUX, free, no API key) ────────────
+    if use_pollinations:
+        img = _try_pollinations(prompt, width, height, seed=seed)
+        if img:
+            img.save(output_path)
+            print(f"  [FaceGen] '{name}' → {output_path}  (Pollinations.ai)")
+            return output_path
+
+    # ── 3. PIL fallback ───────────────────────────────────────────────────────
+    print(f"  [FaceGen] Rendering '{name}' with PIL portrait (offline fallback)")
     img = _render_portrait(width, height, appearance, name, position)
     img.save(output_path)
-    print(f"  [FaceGen] Saved → {output_path}")
+    print(f"  [FaceGen] '{name}' → {output_path}  (PIL)")
     return output_path
 
 
@@ -401,45 +391,40 @@ def generate_all_faces(
     width: int         = 512,
     height: int        = 512,
     regen: bool        = False,
+    use_pollinations: bool = True,
 ) -> dict[str, str]:
     """
     Generate portrait images for all characters.
-
-    Parameters
-    ----------
-    characters  : {name: {role, gender}} from dialogue JSON
-    appearances : {name: appearance_dict} from OllamaClient
-    output_dir  : directory to save PNGs
-    ollama_url  : Ollama server URL
-    ollama_model: model to try for image generation (None = skip, use PIL)
-    regen       : force regeneration even if file already exists
 
     Returns {name: image_path}
     """
     os.makedirs(output_dir, exist_ok=True)
     face_paths: dict[str, str] = {}
-    positions = ["left", "right"]
+    positions  = ["left", "right"]
+    base_seed  = 1337   # deterministic but distinct seed per character
 
     for idx, (name, info) in enumerate(characters.items()):
         safe = name.lower().replace(" ", "_")
         out  = os.path.join(output_dir, f"face_{safe}.png")
 
         if os.path.isfile(out) and not regen:
-            print(f"  [FaceGen] Using cached portrait for '{name}' → {out}")
+            print(f"  [FaceGen] Cached portrait → '{name}'  ({out})")
             face_paths[name] = out
             continue
 
         generate_face_image(
-            output_path  = out,
-            name         = name,
-            role         = info.get("role", "professional"),
-            gender       = info.get("gender", "neutral"),
-            appearance   = appearances.get(name, {}),
-            ollama_url   = ollama_url,
-            ollama_model = ollama_model,
-            width        = width,
-            height       = height,
-            position     = positions[idx % len(positions)],
+            output_path      = out,
+            name             = name,
+            role             = info.get("role", "professional"),
+            gender           = info.get("gender", "neutral"),
+            appearance       = appearances.get(name, {}),
+            ollama_url       = ollama_url,
+            ollama_model     = ollama_model,
+            width            = width,
+            height           = height,
+            position         = positions[idx % len(positions)],
+            seed             = base_seed + idx * 17,
+            use_pollinations = use_pollinations,
         )
         face_paths[name] = out
 
@@ -447,13 +432,13 @@ def generate_all_faces(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 4 ── Ollama model detection helper
+# Section 5 ── Ollama model detection helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_image_gen_model(ollama_url: str = "http://localhost:11434") -> str | None:
     """
     Probe available Ollama models to find one that can generate images.
-    Returns the first model name that returns images, or None.
+    Returns the first model name that returns image data, or None.
     """
     try:
         r = requests.get(f"{ollama_url}/api/tags", timeout=5)
@@ -461,19 +446,16 @@ def find_image_gen_model(ollama_url: str = "http://localhost:11434") -> str | No
     except Exception:
         return None
 
-    # Keywords that hint a model might support image generation
     image_hints = ["sd", "stable", "diffusion", "flux", "imagen", "dall", "draw"]
+    candidates  = [m for m in models if any(h in m.lower() for h in image_hints)]
+    candidates  = candidates + [m for m in models if m not in candidates]
 
-    candidates = [
-        m for m in models
-        if any(h in m.lower() for h in image_hints)
-    ] + models   # try all if none match hints
-
-    test_prompt = "a simple white circle on black background"
     for model in candidates:
-        img = _try_ollama_image_gen(test_prompt, model, ollama_url, 64, 64)
+        img = _try_ollama_image_gen(
+            "a simple white circle on black background", model, ollama_url, 64, 64
+        )
         if img:
-            print(f"  [FaceGen] Found image-generation model: '{model}'")
+            print(f"  [FaceGen] Ollama image model found: '{model}'")
             return model
 
     return None

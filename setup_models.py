@@ -144,19 +144,39 @@ def _patch_wav2lip_requirements(req_path: str):
 
 
 def _patch_wav2lip_audio():
-    """Remove the res_type= kwarg that librosa 0.10 dropped."""
+    """
+    Patch Wav2Lip/audio.py for librosa >= 0.10 API changes:
+
+      1. librosa.load() dropped the res_type= keyword argument.
+      2. librosa.filters.mel() made sr and n_fft keyword-only (no positional args).
+    """
     import re
     audio_py = os.path.join(WAV2LIP_DIR, "audio.py")
     if not os.path.isfile(audio_py):
         return
+
+    backup = audio_py + ".bak"
     src = open(audio_py, encoding="utf-8").read()
-    patched = re.sub(r",\s*res_type\s*=\s*['\"][^'\"]*['\"]", "", src)
+    if not os.path.exists(backup):
+        open(backup, "w").write(src)
+
+    patched = src
+
+    # Fix 1: remove res_type= kwarg from librosa.load() calls
+    patched = re.sub(r",\s*res_type\s*=\s*['\"][^'\"]*['\"]", "", patched)
+
+    # Fix 2: librosa.filters.mel(sr, n_fft, ...) → mel(sr=sr, n_fft=n_fft, ...)
+    # Matches:  librosa.filters.mel(hp.sample_rate, hp.n_fft,
+    # Replaces positional sr/n_fft with keyword forms.
+    patched = re.sub(
+        r"librosa\.filters\.mel\(\s*([^,]+),\s*([^,]+),",
+        r"librosa.filters.mel(sr=\1, n_fft=\2,",
+        patched,
+    )
+
     if patched != src:
-        backup = audio_py + ".bak"
-        if not os.path.exists(backup):
-            open(backup, "w").write(src)
         open(audio_py, "w", encoding="utf-8").write(patched)
-        print("  ✓ Patched Wav2Lip/audio.py (removed deprecated res_type kwarg)")
+        print("  ✓ Patched Wav2Lip/audio.py (res_type kwarg + mel() positional args)")
 
 
 def step_download_wav2lip_weights():
