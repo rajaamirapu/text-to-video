@@ -54,6 +54,53 @@ def banner(msg: str):
     print(f"\n{'─' * w}\n  {msg}\n{'─' * w}")
 
 
+def _load_face_images(char_names: list, faces_dir: str) -> dict:
+    """
+    Load user-supplied face images from faces_dir.
+
+    Expected filenames (case-insensitive):
+        face_<name>.png / .jpg / .jpeg
+        e.g.  faces/face_alice.png   faces/face_bob.jpg
+
+    Aborts with a clear message listing exactly what files are missing.
+    """
+    face_paths = {}
+    missing    = []
+    extensions = [".png", ".jpg", ".jpeg", ".webp"]
+
+    os.makedirs(faces_dir, exist_ok=True)
+
+    for name in char_names:
+        safe = name.lower().replace(" ", "_")
+        found = None
+        for ext in extensions:
+            candidate = os.path.join(faces_dir, f"face_{safe}{ext}")
+            if os.path.isfile(candidate):
+                found = candidate
+                break
+        if found:
+            print(f"  ✓ {name} → {found}")
+            face_paths[name] = found
+        else:
+            tried = ", ".join(f"face_{safe}{e}" for e in extensions)
+            missing.append(f"  • {faces_dir}/{tried}")
+
+    if missing:
+        msg = (
+            "\n[Error] Missing face image(s). "
+            f"Place your photos in the '{faces_dir}/' folder:\n"
+            + "\n".join(missing)
+            + f"\n\nExample:\n"
+            + "".join(
+                f"  cp /path/to/photo.jpg {faces_dir}/face_{n.lower().replace(' ','_')}.jpg\n"
+                for n in char_names if n not in face_paths
+            )
+        )
+        sys.exit(msg)
+
+    return face_paths
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -63,15 +110,11 @@ def main():
     parser.add_argument("script",              help="Dialogue JSON file")
     parser.add_argument("--output",  "-o",     default="output.mp4")
     parser.add_argument("--ollama-url",        default="http://localhost:11434")
-    parser.add_argument("--ollama-model",      default=None,
-                        help="Ollama model name for image generation "
-                             "(auto-detected if omitted; falls back to PIL portraits)")
     parser.add_argument("--no-ollama",         action="store_true",
                         help="Use built-in default appearances (skip Ollama)")
-    parser.add_argument("--regen-faces",       action="store_true",
-                        help="Force regenerate face images even if cached")
     parser.add_argument("--faces-dir",         default="faces",
-                        help="Directory to store generated face PNGs (default: faces/)")
+                        help="Directory containing face images named "
+                             "face_<name>.png  (e.g. face_alice.png)")
     parser.add_argument("--fps",     type=int, default=25)
     parser.add_argument("--width",   type=int, default=1280)
     parser.add_argument("--height",  type=int, default=720)
@@ -126,33 +169,9 @@ def main():
         appearances[name] = app
         print(f"  ✓ {name}: skin={app.get('skin_rgb')} hair={app.get('hair_rgb')}")
 
-    # ── 4. Generate portrait images (Ollama image gen or PIL) ────────────────
-    banner("Generating character portraits")
-    from face_generator import generate_all_faces, find_image_gen_model
-
-    # Determine which Ollama model to use for image generation
-    img_model = args.ollama_model
-    if img_model is None and use_ollama:
-        print("  Probing Ollama for an image-generation model …")
-        img_model = find_image_gen_model(args.ollama_url)
-        if img_model:
-            print(f"  Found image-gen model: {img_model}")
-        else:
-            print("  No image-gen model found — using enhanced PIL portraits")
-
-    face_paths = generate_all_faces(
-        characters   = {n: data["characters"][n] for n in char_names},
-        appearances  = appearances,
-        output_dir   = args.faces_dir,
-        ollama_url   = args.ollama_url,
-        ollama_model = img_model,
-        width        = 512,
-        height       = 512,
-        regen        = args.regen_faces,
-    )
-    print(f"\n  Face images:")
-    for name, path in face_paths.items():
-        print(f"    {name} → {path}")
+    # ── 4. Load face images (user-supplied) ──────────────────────────────────
+    banner("Loading face images")
+    face_paths = _load_face_images(char_names, args.faces_dir)
 
     # List of face paths in character order
     ordered_faces = [face_paths[n] for n in char_names]
