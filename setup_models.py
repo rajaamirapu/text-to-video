@@ -72,10 +72,26 @@ def step_clone_wav2lip():
 
 def step_install_wav2lip_deps():
     banner("2 / 5  Install Wav2Lip Python dependencies")
+
+    # ── Python 3.12: fix distutils/CCompiler BEFORE installing anything ───────
+    # setuptools provides the distutils shim that numba/librosa 0.8 need.
+    # numba>=0.59 and librosa>=0.10 are the first versions with native 3.12 support.
+    print("  Applying Python 3.12 compatibility fixes …")
+    pip_install("setuptools", "wheel")
+    pip_install("numba>=0.59.0", "librosa>=0.10.0", "soundfile>=0.12.1")
+
+    # ── Patch Wav2Lip's pinned requirements BEFORE pip reads them ─────────────
     req = os.path.join(WAV2LIP_DIR, "requirements.txt")
+    _patch_wav2lip_requirements(req)
+
+    # ── Now install Wav2Lip deps (uses our patched requirements.txt) ──────────
     if os.path.isfile(req):
         run([sys.executable, "-m", "pip", "install", "-r", req])
-    # Additional packages used by our pipeline
+
+    # ── Patch Wav2Lip/audio.py for librosa 0.10 API changes ──────────────────
+    _patch_wav2lip_audio()
+
+    # ── Additional pipeline packages ──────────────────────────────────────────
     pip_install(
         "gdown",            # Google Drive downloader
         "diffusers",        # Stable Diffusion
@@ -84,16 +100,53 @@ def step_install_wav2lip_deps():
         "xformers",         # optional memory optimisation
         "gtts",
         "pyttsx3",
-        "librosa",
-        "soundfile",
-        "scipy",
         "moviepy",
         "Pillow",
-        "numpy",
+        "numpy>=1.24,<2.0",
         "requests",
         "tqdm",
+        "huggingface_hub",
     )
-    print("  ✓ Dependencies installed")
+    print("  ✓ All dependencies installed")
+
+
+def _patch_wav2lip_requirements(req_path: str):
+    """Replace Wav2Lip's pinned librosa==0.8 with a Python 3.12-safe range."""
+    if not os.path.isfile(req_path):
+        return
+    original = open(req_path).read()
+    if "librosa>=0.10" in original:
+        return  # already patched
+
+    # Back up only once
+    backup = req_path + ".bak"
+    if not os.path.exists(backup):
+        open(backup, "w").write(original)
+
+    import re
+    patched = original
+    # Replace any pinned librosa version with a safe range
+    patched = re.sub(r"librosa[=<>!~][^\n]*", "librosa>=0.10.0", patched)
+    # Replace any pinned numba version
+    patched = re.sub(r"numba[=<>!~][^\n]*", "numba>=0.59.0", patched)
+    open(req_path, "w").write(patched)
+    print("  ✓ Patched Wav2Lip/requirements.txt (librosa + numba pins removed)")
+
+
+def _patch_wav2lip_audio():
+    """Remove the res_type= kwarg that librosa 0.10 dropped."""
+    import re
+    audio_py = os.path.join(WAV2LIP_DIR, "audio.py")
+    if not os.path.isfile(audio_py):
+        return
+    src = open(audio_py, encoding="utf-8").read()
+    patched = re.sub(r",\s*res_type\s*=\s*['\"][^'\"]*['\"]", "", src)
+    if patched != src:
+        backup = audio_py + ".bak"
+        if not os.path.exists(backup):
+            open(backup, "w").write(src)
+        open(audio_py, "w", encoding="utf-8").write(patched)
+        print("  ✓ Patched Wav2Lip/audio.py (removed deprecated res_type kwarg)")
 
 
 def step_download_wav2lip_weights():
