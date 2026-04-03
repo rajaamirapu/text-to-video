@@ -77,12 +77,24 @@ def step_clone_wav2lip():
 def step_install_wav2lip_deps():
     banner("2 / 5  Install Wav2Lip Python dependencies")
 
+    # ── NumPy <2.0 MUST be pinned first ──────────────────────────────────────
+    # NumPy 2.x removed numpy.core, breaking scipy, librosa, and Wav2Lip.
+    # Force a 1.x wheel before any other package pulls in numpy.
+    print("  Pinning numpy<2.0 (required by scipy / librosa / Wav2Lip) …")
+    run([
+        sys.executable, "-m", "pip", "install",
+        "--force-reinstall",
+        "--only-binary=numpy",
+        "numpy>=1.26.0,<2.0",
+    ])
+
     # ── Python 3.12: fix distutils/CCompiler BEFORE installing anything ───────
     # setuptools provides the distutils shim that numba/librosa 0.8 need.
     # numba>=0.59 and librosa>=0.10 are the first versions with native 3.12 support.
     print("  Applying Python 3.12 compatibility fixes …")
     pip_install("setuptools", "wheel")
-    pip_install("numba>=0.59.0", "librosa>=0.10.0", "soundfile>=0.12.1")
+    pip_install("numba>=0.59.0", "librosa>=0.10.0", "soundfile>=0.12.1",
+                "scipy>=1.11.0")
 
     # ── Patch Wav2Lip's pinned requirements BEFORE pip reads them ─────────────
     req = os.path.join(WAV2LIP_DIR, "requirements.txt")
@@ -97,19 +109,13 @@ def step_install_wav2lip_deps():
 
     # ── Additional pipeline packages ──────────────────────────────────────────
     pip_install(
-        "gdown",            # Google Drive downloader
-        "diffusers>=0.29.0",        # Stable Diffusion
-        "transformers>=4.41.0",     # must match diffusers (CLIPImageProcessor)
-        "accelerate>=0.30.0",
-        "xformers",         # optional memory optimisation
+        "gdown",      # Google Drive downloader
         "gtts",
         "pyttsx3",
         "moviepy",
         "Pillow",
-        "numpy>=1.26.0,<2.0",
         "requests",
         "tqdm",
-        "huggingface_hub",
     )
     print("  ✓ All dependencies installed")
 
