@@ -55,7 +55,11 @@ def run(cmd: list[str], **kwargs):
 
 
 def pip_install(*packages: str):
-    run([sys.executable, "-m", "pip", "install", "--upgrade", *packages])
+    run([
+        sys.executable, "-m", "pip", "install", "--upgrade",
+        "--only-binary=numpy,numba",   # never compile numpy/numba from source
+        *packages,
+    ])
 
 
 # ── steps ─────────────────────────────────────────────────────────────────────
@@ -94,15 +98,15 @@ def step_install_wav2lip_deps():
     # ── Additional pipeline packages ──────────────────────────────────────────
     pip_install(
         "gdown",            # Google Drive downloader
-        "diffusers",        # Stable Diffusion
-        "transformers",
-        "accelerate",
+        "diffusers>=0.29.0",        # Stable Diffusion
+        "transformers>=4.41.0",     # must match diffusers (CLIPImageProcessor)
+        "accelerate>=0.30.0",
         "xformers",         # optional memory optimisation
         "gtts",
         "pyttsx3",
         "moviepy",
         "Pillow",
-        "numpy>=1.24,<2.0",
+        "numpy>=1.26.0,<2.0",
         "requests",
         "tqdm",
         "huggingface_hub",

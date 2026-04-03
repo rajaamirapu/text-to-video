@@ -40,7 +40,11 @@ def run(cmd: list[str], **kw):
 
 
 def pip(*packages: str):
-    run([sys.executable, "-m", "pip", "install", "--upgrade", *packages])
+    run([
+        sys.executable, "-m", "pip", "install", "--upgrade",
+        "--only-binary=numpy,numba",   # never compile from source
+        *packages,
+    ])
 
 
 # ── step 1: core fixes ────────────────────────────────────────────────────────
@@ -53,7 +57,7 @@ def fix_packages():
         "numba>=0.59.0",       # first numba release with Python 3.12 support
         "librosa>=0.10.0",     # compatible with new numba
         "soundfile>=0.12.1",   # our primary audio loader (no numba at all)
-        "numpy>=1.24,<2.0",    # stay on 1.x for Wav2Lip compatibility
+        "numpy>=1.26.0,<2.0",    # stay on 1.x for Wav2Lip compatibility
     )
     print("  ✓ Packages updated")
 
@@ -112,7 +116,7 @@ WAV2LIP_REQ = os.path.join(WAV2LIP_DIR, "requirements.txt")
 COMPATIBLE_REQS = """\
 # Wav2Lip requirements — patched for Python 3.12 compatibility
 librosa>=0.10.0
-numpy>=1.24,<2.0
+numpy>=1.26.0,<2.0
 scipy>=1.11
 opencv-python>=4.8
 tqdm>=4.65

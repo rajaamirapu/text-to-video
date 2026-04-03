@@ -52,11 +52,17 @@ def _get_pipeline(model_id: str = DEFAULT_SD_MODEL):
     try:
         import torch
         from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
-    except ImportError as e:
-        sys.exit(
-            f"[Error] Missing dependency: {e}\n"
-            f"  Run: pip install diffusers transformers accelerate torch torchvision"
+    except (ImportError, RuntimeError) as e:
+        err = str(e)
+        hint = (
+            "  Run:  python fix_diffusers.py\n"
+            "  Then: pip install diffusers>=0.29.0 transformers>=4.41.0 accelerate>=0.30.0"
         )
+        if "CLIPImageProcessor" in err:
+            sys.exit(
+                f"[Error] diffusers/transformers version mismatch:\n  {err}\n{hint}"
+            )
+        sys.exit(f"[Error] Missing dependency: {err}\n{hint}")
 
     device   = "cuda" if torch.cuda.is_available() else "cpu"
     dtype    = torch.float16 if device == "cuda" else torch.float32
