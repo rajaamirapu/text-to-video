@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-main.py — Text-to-Video with Real Human Faces (Ollama + SD + Wav2Lip)
+main.py — Text-to-Video with AI Portraits (Ollama + Wav2Lip)
 =======================================================================
 
 Full pipeline
 -------------
   1. Load dialogue JSON (characters + dialogue lines)
-  2. Ollama LLM  →  character appearance description
-  3. Stable Diffusion (GPU)  →  photorealistic portrait per character
+  2. Ollama LLM  →  character appearance description (colours, style)
+  3. Ollama image model (if available) or enhanced PIL  →  portrait per character
   4. For each dialogue line:
        a. gTTS  →  TTS audio (.mp3)
        b. Wav2Lip (GPU)  →  lip-synced talking face video for the speaker
@@ -16,8 +16,9 @@ Full pipeline
 
 Prerequisites
 -------------
-  python setup_models.py        # clone Wav2Lip, download weights, cache SD model
+  python setup_models.py        # clone Wav2Lip, download weights
   pip install -r requirements.txt
+  ollama serve                  # optional but recommended
 
 Usage
 -----
@@ -62,13 +63,11 @@ def main():
     parser.add_argument("script",              help="Dialogue JSON file")
     parser.add_argument("--output",  "-o",     default="output.mp4")
     parser.add_argument("--ollama-url",        default="http://localhost:11434")
+    parser.add_argument("--ollama-model",      default=None,
+                        help="Ollama model name for image generation "
+                             "(auto-detected if omitted; falls back to PIL portraits)")
     parser.add_argument("--no-ollama",         action="store_true",
                         help="Use built-in default appearances (skip Ollama)")
-    parser.add_argument("--sd-model",
-                        default=os.environ.get(
-                            "SD_MODEL_ID", "SG161222/Realistic_Vision_V5.1_noVAE"
-                        ),
-                        help="HuggingFace Stable Diffusion model for face generation")
     parser.add_argument("--regen-faces",       action="store_true",
                         help="Force regenerate face images even if cached")
     parser.add_argument("--faces-dir",         default="faces",
@@ -127,21 +126,29 @@ def main():
         appearances[name] = app
         print(f"  ✓ {name}: skin={app.get('skin_rgb')} hair={app.get('hair_rgb')}")
 
-    # ── 4. Generate photorealistic face images (Stable Diffusion) ────────────
-    banner("Generating photorealistic portraits (Stable Diffusion GPU)")
-    from face_generator import generate_all_faces
+    # ── 4. Generate portrait images (Ollama image gen or PIL) ────────────────
+    banner("Generating character portraits")
+    from face_generator import generate_all_faces, find_image_gen_model
 
-    # Remove cached faces if --regen-faces requested
-    if args.regen_faces:
-        import shutil
-        if os.path.isdir(args.faces_dir):
-            shutil.rmtree(args.faces_dir)
+    # Determine which Ollama model to use for image generation
+    img_model = args.ollama_model
+    if img_model is None and use_ollama:
+        print("  Probing Ollama for an image-generation model …")
+        img_model = find_image_gen_model(args.ollama_url)
+        if img_model:
+            print(f"  Found image-gen model: {img_model}")
+        else:
+            print("  No image-gen model found — using enhanced PIL portraits")
 
     face_paths = generate_all_faces(
-        characters  = {n: data["characters"][n] for n in char_names},
-        appearances = appearances,
-        output_dir  = args.faces_dir,
-        model_id    = args.sd_model,
+        characters   = {n: data["characters"][n] for n in char_names},
+        appearances  = appearances,
+        output_dir   = args.faces_dir,
+        ollama_url   = args.ollama_url,
+        ollama_model = img_model,
+        width        = 512,
+        height       = 512,
+        regen        = args.regen_faces,
     )
     print(f"\n  Face images:")
     for name, path in face_paths.items():

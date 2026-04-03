@@ -1,27 +1,19 @@
 # ── Core ──────────────────────────────────────────────────────────────────────
 Pillow>=10.0.0
 moviepy>=1.0.3
-numpy>=1.24.0
+numpy>=1.26.0,<2.0
 requests>=2.31.0
-
-# ── Stable Diffusion (face generation, GPU) ───────────────────────────────────
-diffusers>=0.27.0
-transformers>=4.38.0
-accelerate>=0.27.0
-xformers                  # optional: memory-efficient attention on NVIDIA GPUs
-
-# NOTE: Install PyTorch separately for your CUDA version, e.g.:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# See: https://pytorch.org/get-started/locally/
 
 # ── Audio / TTS ────────────────────────────────────────────────────────────────
 gTTS>=2.3.2               # Google TTS (requires internet)
 pyttsx3>=2.90             # offline TTS fallback
-librosa>=0.10.0           # audio analysis for lip-sync
-soundfile>=0.12.1         # audio I/O fallback
+soundfile>=0.12.1         # audio I/O (primary lip-sync signal source)
 
-# ── Lip-sync signal processing ────────────────────────────────────────────────
-scipy>=1.11.0
+# ── Lip-sync signal processing (optional enhancements) ────────────────────────
+# librosa and scipy improve lip-sync quality but are not required.
+# The pipeline uses soundfile+numpy as primary, with pure-Python fallbacks.
+# librosa>=0.10.0
+# scipy>=1.11.0
 
 # ── Wav2Lip model download ────────────────────────────────────────────────────
 gdown>=4.7.1              # Google Drive model downloader (used by setup_models.py)
@@ -29,7 +21,9 @@ tqdm>=4.65.0
 
 # ── Ollama HTTP client ─────────────────────────────────────────────────────────
 # (uses built-in requests — no extra package needed)
+# Portrait generation uses Ollama image models (if available) or enhanced PIL.
+# No diffusers / HuggingFace / Stable Diffusion dependency required.
 
 # ── Wav2Lip native dependencies (installed via Wav2Lip/requirements.txt) ───────
-# librosa, numpy, opencv-python, torch, batch_face_detection, etc.
+# numpy, opencv-python, torch, batch_face_detection, librosa, etc.
 # These are handled automatically by setup_models.py
