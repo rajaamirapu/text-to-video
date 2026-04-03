@@ -105,9 +105,15 @@ def run_wav2lip(
         if os.path.isfile(alt):
             checkpoint = alt
 
+    inference_script = os.path.abspath(os.path.join(WAV2LIP_DIR, "inference.py"))
+    checkpoint       = os.path.abspath(checkpoint)
+    face_image_path  = os.path.abspath(face_image_path)
+    audio_path       = os.path.abspath(audio_path)
+    output_path      = os.path.abspath(output_path)
+
     cmd = [
-        sys.executable,                          # same Python that runs this script
-        os.path.join(WAV2LIP_DIR, "inference.py"),
+        sys.executable,     # same Python that runs this script
+        inference_script,
         "--checkpoint_path", checkpoint,
         "--face",            face_image_path,
         "--audio",           audio_path,
@@ -123,7 +129,8 @@ def run_wav2lip(
 
     env = os.environ.copy()
     # Add Wav2Lip dir to PYTHONPATH so its internal imports resolve
-    env["PYTHONPATH"] = WAV2LIP_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    abs_wav2lip = os.path.abspath(WAV2LIP_DIR)
+    env["PYTHONPATH"] = abs_wav2lip + os.pathsep + env.get("PYTHONPATH", "")
 
     print(f"  [Wav2Lip] Running inference …  face={os.path.basename(face_image_path)}")
     result = subprocess.run(
