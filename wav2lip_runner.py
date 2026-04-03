@@ -132,10 +132,15 @@ def run_wav2lip(
     abs_wav2lip = os.path.abspath(WAV2LIP_DIR)
     env["PYTHONPATH"] = abs_wav2lip + os.pathsep + env.get("PYTHONPATH", "")
 
+    # Wav2Lip inference.py writes audio to temp/temp.wav relative to its cwd.
+    # Create the temp/ and results/ dirs now so the subprocess doesn't crash.
+    os.makedirs(os.path.join(abs_wav2lip, "temp"),    exist_ok=True)
+    os.makedirs(os.path.join(abs_wav2lip, "results"), exist_ok=True)
+
     print(f"  [Wav2Lip] Running inference …  face={os.path.basename(face_image_path)}")
     result = subprocess.run(
         cmd,
-        cwd=WAV2LIP_DIR,
+        cwd=abs_wav2lip,
         env=env,
         capture_output=True,
         text=True,
@@ -149,7 +154,7 @@ def run_wav2lip(
 
     if not os.path.exists(output_path):
         # Wav2Lip sometimes writes to cwd/results/result_voice.mp4
-        fallback = os.path.join(WAV2LIP_DIR, "results", "result_voice.mp4")
+        fallback = os.path.join(abs_wav2lip, "results", "result_voice.mp4")
         if os.path.exists(fallback):
             shutil.move(fallback, output_path)
         else:
