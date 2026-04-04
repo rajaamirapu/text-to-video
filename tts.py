@@ -15,25 +15,40 @@ import tempfile
 
 # ── pitch shift ───────────────────────────────────────────────────────────────
 
-def _pitch_shift_deep(src: str, dst: str, rate: float = 0.82) -> bool:
+def _pitch_shift_deep(src: str, dst: str, rate: float = 0.75) -> bool:
     """
-    Use ffmpeg to lower the pitch of *src* audio and write to *dst*.
-    rate < 1.0  →  deeper / slower pitch.  0.82 ≈ a full tone lower.
-    Returns True on success.
+    Lower the pitch of *src* audio using ffmpeg and save to *dst*.
+
+    How it works
+    ------------
+    asetrate=44100*rate  — reinterprets audio as lower sample-rate
+                           (same PCM data sounds deeper and slower)
+    aresample=44100      — upsample back to 44.1 kHz  ← pitch stays low,
+                           tempo stays slow
+    atempo=1/rate        — restore original duration WITHOUT touching pitch
+                           (ffmpeg atempo is pitch-preserving time-stretch)
+
+    rate=0.75 → ~5 semitones lower → deep male voice
+    rate=0.70 → ~6 semitones lower → very deep / baritone
     """
     try:
+        # Clamp atempo to ffmpeg's supported range [0.5, 2.0]
+        tempo = min(2.0, max(0.5, 1.0 / rate))
         cmd = [
             "ffmpeg", "-y", "-i", src,
-            "-af", (
-                f"asetrate=44100*{rate},"     # lower sample rate → deeper pitch
-                f"aresample=44100,"           # restore to 44.1 kHz
-                f"atempo={1/rate:.4f}"        # compensate speed so duration stays same
-            ),
+            "-af",
+            f"asetrate=44100*{rate:.4f},aresample=44100,atempo={tempo:.4f}",
+            "-ar", "44100",
             "-q:a", "3",
             dst,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode != 0:
+            print(f"  [TTS] ffmpeg stderr: {result.stderr[-300:].decode(errors='replace')}")
         return result.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
+    except FileNotFoundError:
+        print("  [TTS] ffmpeg not found — skipping pitch shift")
+        return False
     except Exception as e:
         print(f"  [TTS] pitch-shift failed: {e}")
         return False
@@ -107,7 +122,7 @@ def text_to_speech(
     output_path: str | None = None,
     lang: str = "en",
     deep_voice: bool = True,
-    pitch_rate: float = 0.82,
+    pitch_rate: float = 0.75,   # 0.75 ≈ 5 semitones lower → deep male voice
 ) -> str:
     """
     Convert *text* to a deep, masculine audio file.
