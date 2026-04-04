@@ -123,8 +123,10 @@ def _make_room_background(width: int, height: int) -> Image.Image:
     for i in range(30):
         alpha = int(90 * (1 - i / 30) ** 2)
         pad   = int(i * min(width, height) * 0.018)
-        vd.rectangle([pad, pad, width - pad, height - pad],
-                     outline=(0, 0, 0, alpha), width=2)
+        x1, y1 = width - pad - 1, height - pad - 1
+        if x1 <= pad or y1 <= pad:
+            break
+        vd.rectangle([pad, pad, x1, y1], outline=(0, 0, 0, alpha), width=2)
     base = img.convert("RGBA")
     base.alpha_composite(vig)
     return base.convert("RGB")
