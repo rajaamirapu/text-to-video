@@ -124,6 +124,9 @@ def main():
                         help="Silence gap between dialogue lines in seconds")
     parser.add_argument("--no-gan",  action="store_true",
                         help="Use wav2lip.pth instead of wav2lip_gan.pth (faster)")
+    parser.add_argument("--room-bg", default=None,
+                        help="Path to a custom room background image (JPG/PNG). "
+                             "Uses built-in PIL office room if omitted.")
     args = parser.parse_args()
 
     # ── 1. Load script ────────────────────────────────────────────────────────
@@ -183,7 +186,8 @@ def main():
     from video_composer import VideoComposer
     from lip_sync       import get_audio_duration
 
-    composer   = VideoComposer(args.width, args.height, args.fps)
+    composer   = VideoComposer(args.width, args.height, args.fps,
+                               room_bg_path=args.room_bg)
     clips      = []
     temp_files = []
     tmp_dir    = tempfile.mkdtemp(prefix="ttv_")
