@@ -179,6 +179,54 @@ def main():
     # List of face paths in character order
     ordered_faces = [face_paths[n] for n in char_names]
 
+    # ── 4b. Generate scene assets with Ollama image model ────────────────────
+    banner("Generating scene (Ollama image model)")
+    from scene_generator import find_image_model, generate_room_background, generate_character_body
+
+    img_model = None
+    if use_ollama:
+        print("  Searching for Ollama image-generation model …")
+        img_model = find_image_model(args.ollama_url)
+        if img_model:
+            print(f"  ✓ Using image model: {img_model}")
+        else:
+            print("  No image-gen model found — using PIL room + face headshots")
+
+    # Generate photorealistic room background once (cached to faces/room_bg.png)
+    room_img = generate_room_background(
+        width        = args.width,
+        height       = int(args.height * 0.85),   # room area (above subtitle)
+        ollama_url   = args.ollama_url,
+        image_model  = img_model,
+        cache_dir    = args.faces_dir,
+        room_bg_path = args.room_bg,
+    )
+
+    # Optionally generate seated body images for each character
+    # (improves realism; falls back to headshot if generation fails)
+    char_body_paths: dict[str, str | None] = {}
+    for idx, name in enumerate(char_names):
+        info  = data["characters"][name]
+        app   = appearances.get(name, {})
+        body  = generate_character_body(
+            name        = name,
+            role        = info.get("role", "person"),
+            gender      = info.get("gender", "neutral"),
+            appearance  = app,
+            width       = int(args.width * 0.38),
+            height      = int(args.width * 0.38 * 1.28),
+            ollama_url  = args.ollama_url,
+            image_model = img_model,
+            cache_dir   = args.faces_dir,
+            idx         = idx,
+        )
+        safe = name.lower().replace(" ", "_")
+        if body:
+            body_path = os.path.join(args.faces_dir, f"body_{safe}.png")
+            char_body_paths[name] = body_path
+        else:
+            char_body_paths[name] = None   # falls back to face headshot
+
     # ── 5. Build dialogue segments ────────────────────────────────────────────
     banner(f"Generating {len(dialogue)} dialogue segments")
     from tts           import text_to_speech
@@ -186,8 +234,11 @@ def main():
     from video_composer import VideoComposer
     from lip_sync       import get_audio_duration
 
-    composer   = VideoComposer(args.width, args.height, args.fps,
-                               room_bg_path=args.room_bg)
+    composer   = VideoComposer(
+        args.width, args.height, args.fps,
+        room_bg_image = room_img,
+        char_body_paths = char_body_paths,
+    )
     clips      = []
     temp_files = []
     tmp_dir    = tempfile.mkdtemp(prefix="ttv_")

@@ -310,22 +310,24 @@ class VideoComposer:
         width: int = 1280,
         height: int = 720,
         fps: int = 25,
-        room_bg_path: str | None = None,
+        room_bg_path: str | None = None,       # legacy path-based option
+        room_bg_image: Image.Image | None = None,   # pre-generated PIL image
+        char_body_paths: dict | None = None,   # {name: path_or_None}
     ):
-        self.width        = width
-        self.height       = height
-        self.fps          = fps
-        self.room_bg_path = room_bg_path
-        self.char_h       = int(height * (1 - self.SUBTITLE_RATIO))
-        self.sub_h        = height - self.char_h
+        self.width           = width
+        self.height          = height
+        self.fps             = fps
+        self.room_bg_path    = room_bg_path
+        self.room_bg_image   = room_bg_image
+        self.char_body_paths = char_body_paths or {}
+        self.char_h          = int(height * (1 - self.SUBTITLE_RATIO))
+        self.sub_h           = height - self.char_h
 
         # Face bust size — tall portrait, ~36 % of frame width
         self.fw = int(width * 0.36)
         self.fh = int(self.fw * 1.28)
 
         # Character centre positions (seated in sofa areas)
-        # Left person sits left-of-centre, right person right-of-centre
-        # Y is ~55 % down the room area so they appear seated
         cx_l = int(width * 0.24)
         cx_r = int(width * 0.76)
         cy   = int(self.char_h * 0.52)
@@ -384,8 +386,16 @@ class VideoComposer:
         listener_idx = 1 - speaker_idx
 
         # Pre-build static resources
-        room_bg       = _get_room_bg(self.width, self.char_h, self.room_bg_path)
-        listener_face = Image.open(face_image_paths[listener_idx]).convert("RGB")
+        # Use pre-generated image if available, else fall back to PIL/path
+        if self.room_bg_image is not None:
+            room_bg = self.room_bg_image.resize((self.width, self.char_h), Image.LANCZOS)
+        else:
+            room_bg = _get_room_bg(self.width, self.char_h, self.room_bg_path)
+
+        # Use Ollama-generated body image if available, else face headshot
+        listener_name = None  # we don't have name here; use path directly
+        listener_img_path = face_image_paths[listener_idx]
+        listener_face = Image.open(listener_img_path).convert("RGB")
         glow          = _speaker_glow(self.fw, self.fh)
         subtitle      = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
