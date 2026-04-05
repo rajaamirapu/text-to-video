@@ -16,6 +16,7 @@ import io
 import json
 import os
 import sys
+import urllib.parse
 
 import requests
 from PIL import Image
@@ -25,27 +26,105 @@ OLLAMA_URL = "http://localhost:11434"
 
 
 def generate_image(prompt: str, model: str, width: int, height: int) -> Image.Image:
-    """Call Ollama /api/generate and return a PIL image."""
-    print(f"  → Prompt: {prompt[:80]}…")
-    payload = {
-        "model":  model,
-        "prompt": prompt,
-        "stream": False,
-    }
-    r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=300)
-    r.raise_for_status()
-    data = r.json()
+    """
+    Call Ollama and return a PIL image.
+    Tries multiple request formats to handle different model APIs.
+    """
+    print(f"  → Prompt: {prompt[:90]}…")
 
-    images = data.get("images") or []
-    if not images:
-        raise RuntimeError(
-            f"Model '{model}' returned no images. "
-            "Make sure it is an image-generation model (e.g. x/z-image-turbo)."
-        )
+    # ── Attempt 1: standard /api/generate with JSON response ─────────────────
+    for payload in [
+        # format A — plain generate
+        {"model": model, "prompt": prompt, "stream": False},
+        # format B — with explicit size options (some models support this)
+        {"model": model, "prompt": prompt, "stream": False,
+         "options": {"width": width, "height": height}},
+        # format C — images key in request (some vision/gen models)
+        {"model": model, "prompt": prompt, "stream": False,
+         "format": "json"},
+    ]:
+        try:
+            r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=300)
+            print(f"  → HTTP {r.status_code}  content-type: {r.headers.get('Content-Type','?')}")
 
-    img_bytes = base64.b64decode(images[0])
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    return img.resize((width, height), Image.LANCZOS)
+            # Check if response is raw image bytes (some models return binary)
+            ct = r.headers.get("Content-Type", "")
+            if "image" in ct:
+                img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                return img.resize((width, height), Image.LANCZOS)
+
+            # Try JSON parse
+            raw = r.text.strip()
+            if not raw:
+                print("  → Empty response body, trying next format …")
+                continue
+
+            print(f"  → Response preview: {raw[:200]}")
+            data = r.json()
+
+            # images[] field (standard Ollama image gen response)
+            images = data.get("images") or []
+            if images:
+                img_bytes = base64.b64decode(images[0])
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                return img.resize((width, height), Image.LANCZOS)
+
+            # response field might contain base64 image directly
+            resp_field = data.get("response", "")
+            if resp_field and len(resp_field) > 100:
+                try:
+                    img_bytes = base64.b64decode(resp_field)
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    return img.resize((width, height), Image.LANCZOS)
+                except Exception:
+                    pass
+
+            print(f"  → No images in response. Keys: {list(data.keys())}")
+            break   # got a valid JSON response but no images — stop trying formats
+
+        except requests.exceptions.HTTPError as e:
+            print(f"  → HTTP error: {e}")
+            break
+        except json.JSONDecodeError:
+            # Not JSON — maybe raw binary image?
+            if len(r.content) > 1000:
+                try:
+                    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                    return img.resize((width, height), Image.LANCZOS)
+                except Exception:
+                    pass
+            print(f"  → Non-JSON response ({len(r.content)} bytes), trying next …")
+            continue
+
+    # ── Attempt 2: /api/chat with image generation role ──────────────────────
+    print("  → Trying /api/chat endpoint …")
+    try:
+        chat_payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=chat_payload, timeout=300)
+        print(f"  → HTTP {r.status_code}")
+        raw = r.text.strip()
+        if raw:
+            print(f"  → Response preview: {raw[:200]}")
+            data = r.json()
+            images = (data.get("message", {}).get("images") or
+                      data.get("images") or [])
+            if images:
+                img_bytes = base64.b64decode(images[0])
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                return img.resize((width, height), Image.LANCZOS)
+    except Exception as e:
+        print(f"  → /api/chat failed: {e}")
+
+    raise RuntimeError(
+        f"\nModel '{model}' did not return an image.\n"
+        f"Check that it is an image-generation model and is fully loaded.\n"
+        f"Run:  ollama run {model} 'generate image of a red apple'\n"
+        f"to verify it works before using this script."
+    )
 
 
 def portrait_prompt(name: str, role: str, gender: str) -> str:
