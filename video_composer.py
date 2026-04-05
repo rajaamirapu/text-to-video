@@ -1,23 +1,22 @@
 """
 video_composer.py
 
-Composes a two-person conversation inside a room scene.
+Seamless two-person conversation scene — no rectangular boxes.
 
-Layout  (1280×720 default)
-──────────────────────────
+Each frame is composited entirely in PIL so characters blend
+naturally into the room with soft oval masks, exactly like a
+real photo of two people sitting together.
+
+Layout
+──────
   ┌──────────────────────────────────────────────────────┐
   │                                                      │
-  │   ROOM BACKGROUND  (warm office / studio)           │
-  │                                                      │
-  │   [left portrait]              [right portrait]      │  85 % height
-  │   speaker = Wav2Lip video      listener = still img  │
+  │        [person L]      plant/window      [person R]  │  85 %
+  │     soft-oval blend    room background   soft blend  │
   │                                                      │
   ├──────────────────────────────────────────────────────┤
-  │   Subtitle bar  "Speaker: dialogue text …"           │  15 % height
+  │   Subtitle  "Speaker: text …"                        │  15 %
   └──────────────────────────────────────────────────────┘
-
-Everything is composited as numpy ImageClips — no ColorClip, so it
-works with every MoviePy version (1.x and 2.x).
 """
 
 from __future__ import annotations
@@ -28,105 +27,184 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 
-# ── MoviePy import (v1 / v2 compatible) ─────────────────────────────────────
+# ── MoviePy imports ──────────────────────────────────────────────────────────
 
 def _mp():
     try:
-        from moviepy.editor import (
-            VideoFileClip, ImageClip, CompositeVideoClip,
-            AudioFileClip, concatenate_videoclips,
-        )
+        from moviepy.editor import VideoFileClip, AudioFileClip, VideoClip, concatenate_videoclips
     except ImportError:
-        from moviepy import (
-            VideoFileClip, ImageClip, CompositeVideoClip,
-            AudioFileClip, concatenate_videoclips,
-        )
-    return VideoFileClip, ImageClip, CompositeVideoClip, AudioFileClip, concatenate_videoclips
-
-
-def _pos(clip, x, y):
-    """Set clip position — compatible with MoviePy v1 and v2."""
-    if hasattr(clip, "with_position"):
-        return clip.with_position((x, y))
-    return clip.set_position((x, y))
+        from moviepy import VideoFileClip, AudioFileClip, VideoClip, concatenate_videoclips
+    return VideoFileClip, AudioFileClip, VideoClip, concatenate_videoclips
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Room background
+# Room background — modern lounge (plants + large windows + sofa)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_room_background(width: int, height: int) -> Image.Image:
-    """Render a warm office room background with PIL."""
+    """
+    Renders a modern lounge room similar to the reference image:
+    large rear windows, monstera plants, warm ambient light, sofa seats.
+    """
     img  = Image.new("RGB", (width, height))
     draw = ImageDraw.Draw(img)
-    wall_h = int(height * 0.62)
 
-    # Wall — cream-beige gradient
+    wall_h = int(height * 0.68)
+
+    # ── rear wall — warm off-white gradient ──────────────────────────────────
     for y in range(wall_h):
-        t = y / max(1, wall_h)
-        draw.line([(0, y), (width, y)], fill=(
-            int(215 - t * 18),
-            int(205 - t * 14),
-            int(190 - t * 12),
-        ))
+        t   = y / max(1, wall_h)
+        col = (int(240 - t * 22), int(238 - t * 18), int(228 - t * 14))
+        draw.line([(0, y), (width, y)], fill=col)
 
-    # Window + light bloom
-    win_cx, win_cy = width // 2, int(wall_h * 0.38)
-    win_w, win_h   = 260, 190
-    wx0, wy0 = win_cx - win_w // 2, win_cy - win_h // 2
-    wx1, wy1 = win_cx + win_w // 2, win_cy + win_h // 2
+    # ── large panoramic window (centre rear) ─────────────────────────────────
+    win_x0, win_y0 = int(width * 0.20), int(height * 0.04)
+    win_x1, win_y1 = int(width * 0.80), int(wall_h * 0.82)
 
-    for r in range(200, 0, -20):
-        draw.ellipse([win_cx - r * 2, win_cy - r, win_cx + r * 2, win_cy + r],
-                     fill=(min(255, 240 + r // 12), min(255, 245 + r // 14), 255))
+    # sky gradient inside glass
+    for y in range(win_y0, win_y1):
+        t   = (y - win_y0) / max(1, win_y1 - win_y0)
+        col = (int(185 + t * 40), int(215 + t * 20), int(245))
+        draw.line([(win_x0, y), (win_x1, y)], fill=col)
 
-    for y in range(wy0, wy1):
-        t = (y - wy0) / max(1, wy1 - wy0)
-        draw.line([(wx0, y), (wx1, y)], fill=(
-            int(175 + t * 35), int(205 + t * 20), 240))
+    # foliage blur seen through window
+    for i in range(12):
+        gx = win_x0 + int((win_x1 - win_x0) * (0.1 + i * 0.07))
+        gy = win_y0 + int((win_y1 - win_y0) * (0.35 + (i % 3) * 0.12))
+        gr = int(height * 0.10) + (i % 4) * 12
+        alpha_col = (int(80 + i * 8), int(130 + i * 5), int(70 + i * 3))
+        draw.ellipse([gx - gr, gy - gr // 2, gx + gr, gy + gr], fill=alpha_col)
 
-    frame_col = (155, 138, 110)
-    draw.rectangle([wx0, wy0, wx1, wy1], outline=frame_col, width=7)
-    draw.line([(win_cx, wy0), (win_cx, wy1)], fill=frame_col, width=5)
-    draw.line([(wx0, win_cy), (wx1, win_cy)], fill=frame_col, width=5)
+    # window frame
+    frame_col = (90, 95, 90)
+    draw.rectangle([win_x0, win_y0, win_x1, win_y1], outline=frame_col, width=6)
+    # frame mullions — two vertical
+    for frac in (0.33, 0.67):
+        fx = int(win_x0 + (win_x1 - win_x0) * frac)
+        draw.line([(fx, win_y0), (fx, win_y1)], fill=frame_col, width=5)
+    # one horizontal
+    fy = int(win_y0 + (win_y1 - win_y0) * 0.5)
+    draw.line([(win_x0, fy), (win_x1, fy)], fill=frame_col, width=5)
 
-    # Floor — hardwood gradient
+    # window sill
+    draw.rectangle([win_x0 - 6, win_y1, win_x1 + 6, win_y1 + 10],
+                   fill=(200, 195, 180))
+
+    # window light bloom on wall
+    for r in range(300, 0, -25):
+        t   = r / 300
+        col = (min(255, int(255 - t * 15)),
+               min(255, int(255 - t * 12)),
+               min(255, int(250 - t * 8)))
+        cx, cy = (win_x0 + win_x1) // 2, (win_y0 + win_y1) // 2
+        draw.ellipse([cx - r * 2, cy - r, cx + r * 2, cy + r], fill=col)
+
+    # Re-draw window over bloom
+    for y in range(win_y0, win_y1):
+        t   = (y - win_y0) / max(1, win_y1 - win_y0)
+        col = (int(185 + t * 40), int(215 + t * 20), 245)
+        draw.line([(win_x0, y), (win_x1, y)], fill=col)
+    draw.rectangle([win_x0, win_y0, win_x1, win_y1], outline=frame_col, width=6)
+    for frac in (0.33, 0.67):
+        fx = int(win_x0 + (win_x1 - win_x0) * frac)
+        draw.line([(fx, win_y0), (fx, win_y1)], fill=frame_col, width=5)
+    draw.line([(win_x0, fy), (win_x1, fy)], fill=frame_col, width=5)
+
+    # ── floor — light wood / stone ───────────────────────────────────────────
     for y in range(wall_h, height):
-        t = (y - wall_h) / max(1, height - wall_h)
-        draw.line([(0, y), (width, y)], fill=(
-            int(148 - t * 30), int(108 - t * 22), int(68 - t * 16)))
+        t   = (y - wall_h) / max(1, height - wall_h)
+        col = (int(210 - t * 40), int(200 - t * 35), int(185 - t * 30))
+        draw.line([(0, y), (width, y)], fill=col)
 
-    for i in range(7):
-        y = wall_h + i * max(1, (height - wall_h) // 6)
-        if y < height:
-            draw.line([(0, y), (width, y)], fill=(120, 88, 55), width=1)
+    # subtle floor planks
+    plank_h = max(1, (height - wall_h) // 8)
+    for i in range(9):
+        py = wall_h + i * plank_h
+        if py < height:
+            draw.line([(0, py), (width, py)], fill=(190, 180, 165), width=1)
 
-    # Baseboard
-    draw.rectangle([0, wall_h - 12, width, wall_h + 4], fill=(185, 173, 152))
+    # baseboard
+    draw.rectangle([0, wall_h - 14, width, wall_h + 5], fill=(220, 215, 200))
+    draw.line([(0, wall_h - 14), (width, wall_h - 14)], fill=(230, 225, 215), width=2)
 
-    # Conference table
-    table_top = int(height * 0.70)
-    tw = int(width * 0.72)
-    tcx = width // 2
-    draw.polygon([
-        (tcx - tw // 2,      table_top),
-        (tcx + tw // 2,      table_top),
-        (tcx + tw // 2 + 80, height + 2),
-        (tcx - tw // 2 - 80, height + 2),
-    ], fill=(125, 88, 52))
-    draw.line([(tcx - tw // 2, table_top), (tcx + tw // 2, table_top)],
-              fill=(165, 125, 82), width=5)
+    # ── monstera plants (left and right foreground) ───────────────────────────
+    for side, px in ((+1, int(width * 0.06)), (-1, int(width * 0.94))):
+        pot_cx = px
+        pot_y  = int(height * 0.78)
+        pot_w, pot_h2 = 38, 44
+        # pot
+        draw.ellipse([pot_cx - pot_w, pot_y, pot_cx + pot_w, pot_y + pot_h2],
+                     fill=(130, 100, 75))
+        draw.ellipse([pot_cx - pot_w + 4, pot_y + 4,
+                      pot_cx + pot_w - 4, pot_y + 14], fill=(150, 118, 88))
+        # stem
+        draw.line([(pot_cx, pot_y), (pot_cx + side * 20, int(height * 0.30))],
+                  fill=(60, 90, 55), width=4)
+        # leaves (large monstera-ish ovals)
+        leaf_col  = (55, 120, 65)
+        leaf_col2 = (70, 145, 75)
+        leaf_positions = [
+            (pot_cx + side * 25, int(height * 0.28), 75, 45),
+            (pot_cx + side * 10, int(height * 0.38), 60, 38),
+            (pot_cx + side * 40, int(height * 0.35), 65, 40),
+            (pot_cx + side * 5,  int(height * 0.22), 55, 35),
+            (pot_cx + side * 55, int(height * 0.25), 50, 32),
+        ]
+        for lx, ly, lw, lh in leaf_positions:
+            draw.ellipse([lx - lw, ly - lh, lx + lw, ly + lh], fill=leaf_col)
+            # mid-rib
+            draw.line([(lx - lw + 10, ly), (lx + lw - 10, ly)],
+                      fill=leaf_col2, width=2)
 
-    # Vignette
+    # ── sofa / couch (lower left and right) ──────────────────────────────────
+    sofa_y = int(height * 0.72)
+    sofa_h2 = int(height * 0.14)
+    sofa_col  = (180, 170, 158)
+    sofa_col2 = (165, 155, 143)
+    for sx0, sx1 in (
+        (int(width * 0.01), int(width * 0.38)),
+        (int(width * 0.62), int(width * 0.99)),
+    ):
+        # seat
+        draw.rounded_rectangle([sx0, sofa_y, sx1, sofa_y + sofa_h2],
+                                radius=8, fill=sofa_col)
+        # back cushion
+        draw.rounded_rectangle([sx0, int(height * 0.60), sx1, sofa_y + 6],
+                                radius=6, fill=sofa_col2)
+        # arm rests
+        arm_w = int((sx1 - sx0) * 0.08)
+        for ax in (sx0, sx1 - arm_w):
+            draw.rounded_rectangle([ax, int(height * 0.62), ax + arm_w, sofa_y + sofa_h2],
+                                    radius=5, fill=sofa_col2)
+        # seat highlight
+        draw.line([(sx0 + 10, sofa_y + 8), (sx1 - 10, sofa_y + 8)],
+                  fill=(200, 192, 180), width=2)
+
+    # coffee table (centre)
+    ct_y  = int(height * 0.78)
+    ct_w  = int(width * 0.18)
+    ct_cx = width // 2
+    draw.rounded_rectangle([ct_cx - ct_w, ct_y, ct_cx + ct_w, ct_y + 22],
+                            radius=6, fill=(160, 140, 110))
+    draw.line([(ct_cx - ct_w + 6, ct_y + 3), (ct_cx + ct_w - 6, ct_y + 3)],
+              fill=(180, 162, 128), width=2)
+    # coffee cups on table
+    for cup_x in (ct_cx - 30, ct_cx + 30):
+        draw.ellipse([cup_x - 10, ct_y - 8, cup_x + 10, ct_y + 6], fill=(245, 243, 238))
+        draw.ellipse([cup_x - 8, ct_y - 6, cup_x + 8, ct_y + 4], fill=(220, 210, 195))
+
+    # ── vignette ─────────────────────────────────────────────────────────────
     vig = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     vd  = ImageDraw.Draw(vig)
-    for i in range(30):
-        alpha = int(90 * (1 - i / 30) ** 2)
-        pad   = int(i * min(width, height) * 0.018)
-        x1, y1 = width - pad - 1, height - pad - 1
+    for i in range(25):
+        alpha = int(70 * (1 - i / 25) ** 2)
+        pad   = int(i * min(width, height) * 0.02)
+        x1 = width - pad - 1
+        y1 = height - pad - 1
         if x1 <= pad or y1 <= pad:
             break
         vd.rectangle([pad, pad, x1, y1], outline=(0, 0, 0, alpha), width=2)
+
     base = img.convert("RGBA")
     base.alpha_composite(vig)
     return base.convert("RGB")
@@ -135,61 +213,88 @@ def _make_room_background(width: int, height: int) -> Image.Image:
 _BG_CACHE: dict = {}
 
 
-def _get_room_bg(width: int, height: int, room_bg_path: str | None) -> np.ndarray:
-    key = (width, height, room_bg_path)
+def _get_room_bg(width: int, height: int, path: str | None = None) -> Image.Image:
+    key = (width, height, path)
     if key not in _BG_CACHE:
-        if room_bg_path and os.path.isfile(room_bg_path):
-            img = Image.open(room_bg_path).convert("RGB").resize((width, height), Image.LANCZOS)
+        if path and os.path.isfile(path):
+            img = Image.open(path).convert("RGB").resize((width, height), Image.LANCZOS)
         else:
             img = _make_room_background(width, height)
-        _BG_CACHE[key] = np.asarray(img, dtype=np.uint8)
+        _BG_CACHE[key] = img
     return _BG_CACHE[key]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Face helpers
+# Face blending helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _oval_crop(img: Image.Image) -> Image.Image:
-    """Soft oval mask so the portrait blends into the room."""
-    w, h = img.size
+def _soft_oval_mask(w: int, h: int, feather: float = 0.12) -> Image.Image:
+    """
+    Create a smooth oval alpha mask — hard centre, feathered edges.
+    Larger feather = softer blend into background.
+    """
     mask = Image.new("L", (w, h), 0)
     md   = ImageDraw.Draw(mask)
-    px, py = int(w * 0.06), int(h * 0.04)
+    px   = int(w * 0.05)
+    py   = int(h * 0.03)
     md.ellipse([px, py, w - px, h - py], fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(max(1, int(w * 0.025))))
-    out  = img.convert("RGBA")
-    out.putalpha(mask)
-    return out
+    blur_r = max(2, int(min(w, h) * feather))
+    return mask.filter(ImageFilter.GaussianBlur(blur_r))
 
 
-def _load_face(path: str, fw: int, fh: int) -> Image.Image:
-    img = Image.open(path).convert("RGB").resize((fw, fh), Image.LANCZOS)
-    return _oval_crop(img)
+def _blend_face(
+    canvas: Image.Image,          # RGBA canvas to paste onto
+    face_img: Image.Image,        # RGB face/bust photo
+    cx: int, cy: int,             # centre position on canvas
+    fw: int, fh: int,             # target face size
+    feather: float = 0.14,
+) -> None:
+    """Paste face_img onto canvas with a soft oval blend, in-place."""
+    face = face_img.convert("RGB").resize((fw, fh), Image.LANCZOS)
+    mask = _soft_oval_mask(fw, fh, feather)
+    face_rgba = face.convert("RGBA")
+    face_rgba.putalpha(mask)
+    x = cx - fw // 2
+    y = cy - fh // 2
+    # Clip to canvas bounds
+    canvas.alpha_composite(face_rgba, (max(0, x), max(0, y)))
 
 
-def _glow_overlay(fw: int, fh: int) -> np.ndarray:
-    """Golden speaker glow ring as RGBA numpy array."""
+def _blend_frame_array(
+    canvas: Image.Image,
+    frame_arr: np.ndarray,
+    cx: int, cy: int,
+    fw: int, fh: int,
+    feather: float = 0.14,
+) -> None:
+    """Same as _blend_face but from a raw numpy frame (Wav2Lip output)."""
+    face = Image.fromarray(frame_arr).resize((fw, fh), Image.LANCZOS)
+    _blend_face(canvas, face, cx, cy, fw, fh, feather)
+
+
+def _speaker_glow(fw: int, fh: int) -> Image.Image:
+    """Soft warm rim-light halo around the active speaker. Returns RGBA."""
     glow = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
     gd   = ImageDraw.Draw(glow)
-    for i in range(10):
-        alpha = max(0, 180 - i * 18)
-        p     = i * 2
-        gd.ellipse([p, p, fw - p, fh - p], outline=(255, 200, 80, alpha), width=3)
-    glow = glow.filter(ImageFilter.GaussianBlur(4))
-    return np.asarray(glow, dtype=np.uint8)
+    for i in range(14):
+        alpha = max(0, 140 - i * 10)
+        p     = i * 3
+        if fw - p * 2 > 0 and fh - p * 2 > 0:
+            gd.ellipse([p, p, fw - p, fh - p], outline=(255, 210, 90, alpha), width=3)
+    return glow.filter(ImageFilter.GaussianBlur(6))
 
 
-def _subtitle_img(width: int, height: int, speaker: str, text: str) -> np.ndarray:
-    img  = Image.new("RGB", (width, height), (12, 10, 18))
+def _subtitle_img(width: int, height: int, speaker: str, text: str) -> Image.Image:
+    img  = Image.new("RGB", (width, height), (10, 8, 16))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([0, 0, width, 3], fill=(200, 160, 40))
-    draw.text((30, 8), f"{speaker}:", fill=(255, 200, 60))
-    ty = 30
+    # gold accent bar
+    draw.rectangle([0, 0, width, 4], fill=(210, 168, 42))
+    draw.text((32, 10), f"{speaker}:", fill=(255, 205, 60))
+    ty = 32
     for line in textwrap.wrap(text, width=int(width / 8.5))[:3]:
-        draw.text((30, ty), line, fill=(230, 228, 225))
-        ty += 22
-    return np.asarray(img, dtype=np.uint8)
+        draw.text((32, ty), line, fill=(232, 230, 226))
+        ty += 23
+    return img
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,16 +319,54 @@ class VideoComposer:
         self.char_h       = int(height * (1 - self.SUBTITLE_RATIO))
         self.sub_h        = height - self.char_h
 
-        # Portrait dimensions (~38 % of width, 4:5 aspect)
-        self.face_w = int(width * 0.38)
-        self.face_h = int(self.face_w * 1.20)
+        # Face bust size — tall portrait, ~36 % of frame width
+        self.fw = int(width * 0.36)
+        self.fh = int(self.fw * 1.28)
 
-        # Face centre positions in the room area
-        half = width // 2
-        self.face_centres = [
-            (half // 2,        int(self.char_h * 0.54)),   # left
-            (half + half // 2, int(self.char_h * 0.54)),   # right
-        ]
+        # Character centre positions (seated in sofa areas)
+        # Left person sits left-of-centre, right person right-of-centre
+        # Y is ~55 % down the room area so they appear seated
+        cx_l = int(width * 0.24)
+        cx_r = int(width * 0.76)
+        cy   = int(self.char_h * 0.52)
+        self.centres = [(cx_l, cy), (cx_r, cy)]
+
+    # ── build one composite PIL image (room + both faces) ─────────────────────
+
+    def _build_frame(
+        self,
+        room_bg: Image.Image,
+        listener_face: Image.Image,
+        listener_idx: int,
+        speaker_frame: np.ndarray,
+        speaker_idx: int,
+        glow: Image.Image,
+        subtitle: Image.Image,
+    ) -> np.ndarray:
+        """Compose a single RGB frame as numpy array."""
+
+        canvas = room_bg.convert("RGBA")
+
+        # 1. Listener — static soft-oval portrait
+        lcx, lcy = self.centres[listener_idx]
+        _blend_face(canvas, listener_face, lcx, lcy, self.fw, self.fh)
+
+        # 2. Speaker glow halo (behind face)
+        scx, scy = self.centres[speaker_idx]
+        gx, gy   = scx - self.fw // 2, scy - self.fh // 2
+        canvas.alpha_composite(glow, (max(0, gx), max(0, gy)))
+
+        # 3. Speaker — Wav2Lip frame with soft oval blend
+        _blend_frame_array(canvas, speaker_frame, scx, scy, self.fw, self.fh)
+
+        # 4. Composite into full frame (room area + subtitle)
+        full = Image.new("RGB", (self.width, self.height), (10, 8, 16))
+        full.paste(canvas.convert("RGB"), (0, 0))
+        full.paste(subtitle, (0, self.char_h))
+
+        return np.asarray(full, dtype=np.uint8)
+
+    # ── public segment builder ────────────────────────────────────────────────
 
     def create_segment(
         self,
@@ -234,61 +377,29 @@ class VideoComposer:
         wav2lip_video_path: str,
         audio_path: str,
     ):
-        VideoFileClip, ImageClip, CompositeVideoClip, AudioFileClip, _ = _mp()
+        VideoFileClip, AudioFileClip, VideoClip, _ = _mp()
 
-        # Load Wav2Lip talking video
-        talking  = VideoFileClip(wav2lip_video_path)
-        duration = talking.duration
-
+        talking      = VideoFileClip(wav2lip_video_path)
+        duration     = talking.duration
         listener_idx = 1 - speaker_idx
 
-        # ── Build full background frame as numpy (room + listener face) ────────
-        # Room background for the top char_h rows
-        room_arr = _get_room_bg(self.width, self.char_h, self.room_bg_path)
-        room_img = Image.fromarray(room_arr).convert("RGBA")
+        # Pre-build static resources
+        room_bg       = _get_room_bg(self.width, self.char_h, self.room_bg_path)
+        listener_face = Image.open(face_image_paths[listener_idx]).convert("RGB")
+        glow          = _speaker_glow(self.fw, self.fh)
+        subtitle      = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
-        # Paste listener (static, oval-cropped)
-        l_cx, l_cy = self.face_centres[listener_idx]
-        l_face     = _load_face(face_image_paths[listener_idx], self.face_w, self.face_h)
-        room_img.alpha_composite(l_face, (l_cx - self.face_w // 2, l_cy - self.face_h // 2))
+        def make_frame(t: float) -> np.ndarray:
+            spk_frame = talking.get_frame(t)
+            return self._build_frame(
+                room_bg, listener_face, listener_idx,
+                spk_frame, speaker_idx,
+                glow, subtitle,
+            )
 
-        # Full frame: room area on top, dark subtitle area below
-        full = Image.new("RGB", (self.width, self.height), (12, 10, 18))
-        full.paste(room_img.convert("RGB"), (0, 0))
+        clip = VideoClip(make_frame, duration=duration)
+        clip = clip.with_fps(self.fps) if hasattr(clip, "with_fps") else clip.set_fps(self.fps)
 
-        # ── Background ImageClip (static, whole frame) ─────────────────────────
-        bg_clip = ImageClip(np.asarray(full, dtype=np.uint8), duration=duration)
-        bg_clip = _pos(bg_clip, 0, 0)
-
-        # ── Speaker Wav2Lip clip (positioned in room) ─────────────────────────
-        s_cx, s_cy = self.face_centres[speaker_idx]
-        sx = s_cx - self.face_w // 2
-        sy = s_cy - self.face_h // 2
-
-        try:
-            spk_clip = talking.resized((self.face_w, self.face_h))
-        except AttributeError:
-            spk_clip = talking.resize((self.face_w, self.face_h))
-        spk_clip = _pos(spk_clip, sx, sy)
-
-        # ── Speaker glow ring ─────────────────────────────────────────────────
-        glow_clip = ImageClip(_glow_overlay(self.face_w, self.face_h), duration=duration)
-        glow_clip = _pos(glow_clip, sx, sy)
-
-        # ── Subtitle bar ──────────────────────────────────────────────────────
-        sub_clip = ImageClip(
-            _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text),
-            duration=duration,
-        )
-        sub_clip = _pos(sub_clip, 0, self.char_h)
-
-        # ── Composite ─────────────────────────────────────────────────────────
-        final = CompositeVideoClip(
-            [bg_clip, spk_clip, glow_clip, sub_clip],
-            size=(self.width, self.height),
-        )
-
-        # ── Audio ─────────────────────────────────────────────────────────────
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
             audio = AudioFileClip(audio_path)
             if audio.duration > duration:
@@ -297,15 +408,17 @@ class VideoComposer:
                 except AttributeError:
                     audio = audio.subclip(0, duration)
             try:
-                final = final.with_audio(audio)
+                clip = clip.with_audio(audio)
             except AttributeError:
-                final = final.set_audio(audio)
+                clip = clip.set_audio(audio)
 
-        return final
+        return clip
+
+    # ── export ────────────────────────────────────────────────────────────────
 
     @staticmethod
     def concat_and_write(clips: list, output_path: str, fps: int = 25):
-        _, _, _, _, concatenate_videoclips = _mp()
+        _, _, _, concatenate_videoclips = _mp()
         import inspect, tempfile as _tf
 
         final = concatenate_videoclips(clips, method="compose")
