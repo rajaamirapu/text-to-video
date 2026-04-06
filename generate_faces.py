@@ -2,167 +2,178 @@
 """
 generate_faces.py
 
-Generate face images for all characters using a specific Ollama image model.
+Generate face portraits and room background for all characters using
+Stable Diffusion (via the diffusers library).
 
 Usage:
-    python generate_faces.py                          # uses x/z-image-turbo
-    python generate_faces.py --model some-other-model
+    python generate_faces.py                          # uses default SD model
+    python generate_faces.py --model "runwayml/stable-diffusion-v1-5"
     python generate_faces.py --script my_dialogue.json
+    python generate_faces.py --regen                  # force re-generate
 """
 
 import argparse
-import base64
-import io
 import json
 import os
 import sys
-import urllib.parse
 
-import requests
 from PIL import Image
 
 
-OLLAMA_URL = "http://localhost:11434"
+# ─────────────────────────────────────────────────────────────────────────────
+# Stable Diffusion helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def generate_image(prompt: str, model: str, width: int, height: int) -> Image.Image:
-    """
-    Call Ollama and return a PIL image.
-    Tries multiple request formats to handle different model APIs.
-    """
-    print(f"  → Prompt: {prompt[:90]}…")
-
-    # ── Attempt 1: standard /api/generate with JSON response ─────────────────
-    for payload in [
-        # format A — plain generate
-        {"model": model, "prompt": prompt, "stream": False},
-        # format B — with explicit size options (some models support this)
-        {"model": model, "prompt": prompt, "stream": False,
-         "options": {"width": width, "height": height}},
-        # format C — images key in request (some vision/gen models)
-        {"model": model, "prompt": prompt, "stream": False,
-         "format": "json"},
-    ]:
-        try:
-            r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=300)
-            print(f"  → HTTP {r.status_code}  content-type: {r.headers.get('Content-Type','?')}")
-
-            # Check if response is raw image bytes (some models return binary)
-            ct = r.headers.get("Content-Type", "")
-            if "image" in ct:
-                img = Image.open(io.BytesIO(r.content)).convert("RGB")
-                return img.resize((width, height), Image.LANCZOS)
-
-            # Try JSON parse
-            raw = r.text.strip()
-            if not raw:
-                print("  → Empty response body, trying next format …")
-                continue
-
-            print(f"  → Response preview: {raw[:200]}")
-            data = r.json()
-
-            # images[] field (standard Ollama image gen response)
-            images = data.get("images") or []
-            if images:
-                img_bytes = base64.b64decode(images[0])
-                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                return img.resize((width, height), Image.LANCZOS)
-
-            # response field might contain base64 image directly
-            resp_field = data.get("response", "")
-            if resp_field and len(resp_field) > 100:
-                try:
-                    img_bytes = base64.b64decode(resp_field)
-                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    return img.resize((width, height), Image.LANCZOS)
-                except Exception:
-                    pass
-
-            print(f"  → No images in response. Keys: {list(data.keys())}")
-            break   # got a valid JSON response but no images — stop trying formats
-
-        except requests.exceptions.HTTPError as e:
-            print(f"  → HTTP error: {e}")
-            break
-        except json.JSONDecodeError:
-            # Not JSON — maybe raw binary image?
-            if len(r.content) > 1000:
-                try:
-                    img = Image.open(io.BytesIO(r.content)).convert("RGB")
-                    return img.resize((width, height), Image.LANCZOS)
-                except Exception:
-                    pass
-            print(f"  → Non-JSON response ({len(r.content)} bytes), trying next …")
-            continue
-
-    # ── Attempt 2: /api/chat with image generation role ──────────────────────
-    print("  → Trying /api/chat endpoint …")
+def _load_sd_pipeline(model_id: str):
+    """Load a StableDiffusionPipeline (float16 on CUDA, float32 on CPU)."""
     try:
-        chat_payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-        }
-        r = requests.post(f"{OLLAMA_URL}/api/chat", json=chat_payload, timeout=300)
-        print(f"  → HTTP {r.status_code}")
-        raw = r.text.strip()
-        if raw:
-            print(f"  → Response preview: {raw[:200]}")
-            data = r.json()
-            images = (data.get("message", {}).get("images") or
-                      data.get("images") or [])
-            if images:
-                img_bytes = base64.b64decode(images[0])
-                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                return img.resize((width, height), Image.LANCZOS)
-    except Exception as e:
-        print(f"  → /api/chat failed: {e}")
+        import torch
+        from diffusers import StableDiffusionPipeline
+    except ImportError:
+        sys.exit(
+            "[Error] diffusers / torch not installed.\n"
+            "  Run:  pip install diffusers transformers accelerate torch"
+        )
 
-    raise RuntimeError(
-        f"\nModel '{model}' did not return an image.\n"
-        f"Check that it is an image-generation model and is fully loaded.\n"
-        f"Run:  ollama run {model} 'generate image of a red apple'\n"
-        f"to verify it works before using this script."
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype  = torch.float16 if device == "cuda" else torch.float32
+
+    print(f"  → Loading SD model '{model_id}' on {device} ({dtype}) …")
+    from diffusers import StableDiffusionPipeline
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        safety_checker=None,          # disable for portraits
+        requires_safety_checker=False,
     )
+    pipe = pipe.to(device)
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
+def generate_image(
+    pipe,
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    num_inference_steps: int = 30,
+    guidance_scale: float = 7.5,
+) -> Image.Image:
+    """Run SD inference and return a PIL image."""
+    # SD requires dimensions divisible by 8
+    width  = (width  // 8) * 8
+    height = (height // 8) * 8
+
+    result = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+    )
+    return result.images[0].convert("RGB")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+NEGATIVE = (
+    "cartoon, anime, illustration, painting, sketch, drawing, unrealistic, "
+    "deformed, disfigured, bad anatomy, extra limbs, watermark, logo, text, "
+    "blurry, low quality, low resolution"
+)
+
+ROOM_PROMPT = (
+    "photorealistic modern office lounge interior, empty room no people, "
+    "large floor-to-ceiling panoramic windows with lush green foliage outside, "
+    "monstera plant on left and right, light grey comfortable sofas, "
+    "coffee table with two white mugs, warm diffused natural lighting, "
+    "soft shadows, ultra high detail, 4K, cinematic still, architectural photography"
+)
+
+ROOM_NEGATIVE = (
+    "people, person, human, figure, cartoon, anime, painting, sketch, "
+    "dark, gloomy, blurry, low quality"
+)
 
 
 def portrait_prompt(name: str, role: str, gender: str) -> str:
-    gender_word  = "man" if gender == "male" else "woman"
-    facing       = "slightly right" if gender == "female" else "slightly left"
+    gender_word = "man" if gender == "male" else "woman"
+    facing      = "slightly right" if gender == "female" else "slightly left"
     return (
-        f"photorealistic portrait headshot of a {gender_word}, {role}, named {name}, "
-        f"facing {facing}, natural expression, professional business casual attire, "
+        f"photorealistic portrait headshot of a {gender_word}, {role}, "
+        f"facing {facing}, natural friendly expression, "
+        f"professional business casual attire, "
         f"soft studio lighting, shallow depth of field, sharp focus on face, "
-        f"plain light grey background, 4K DSLR quality, ultra realistic"
+        f"plain light grey background, 4K DSLR quality, ultra realistic skin texture"
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model",  default="x/z-image-turbo",
-                        help="Ollama image model to use")
-    parser.add_argument("--script", default="example_dialogue.json",
-                        help="Dialogue JSON (to read character list)")
-    parser.add_argument("--faces-dir", default="faces",
-                        help="Output directory for face images")
+    parser = argparse.ArgumentParser(
+        description="Generate character face portraits using Stable Diffusion."
+    )
+    parser.add_argument(
+        "--model", default="runwayml/stable-diffusion-v1-5",
+        help="HuggingFace model ID or local path (default: runwayml/stable-diffusion-v1-5)"
+    )
+    parser.add_argument(
+        "--script", default="example_dialogue.json",
+        help="Dialogue JSON (to read character list)"
+    )
+    parser.add_argument("--faces-dir", default="faces",  help="Output directory for face images")
     parser.add_argument("--width",  type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--regen", action="store_true",
-                        help="Regenerate even if cached image exists")
+    parser.add_argument("--steps",  type=int, default=30,  help="SD inference steps")
+    parser.add_argument("--cfg",    type=float, default=7.5, help="Guidance scale")
+    parser.add_argument("--regen",  action="store_true",  help="Regenerate even if cached")
+    parser.add_argument("--room-bg", action="store_true", help="Also generate room background")
     args = parser.parse_args()
 
-    # Load characters from JSON
+    # ── Load characters ───────────────────────────────────────────────────────
     with open(args.script, encoding="utf-8") as f:
         data = json.load(f)
     characters = data.get("characters", {})
 
     os.makedirs(args.faces_dir, exist_ok=True)
 
-    print(f"\nOllama model : {args.model}")
-    print(f"Output dir   : {args.faces_dir}/")
-    print(f"Characters   : {list(characters.keys())}\n")
+    print(f"\nStable Diffusion model : {args.model}")
+    print(f"Output dir             : {args.faces_dir}/")
+    print(f"Characters             : {list(characters.keys())}")
+    if args.room_bg:
+        print("Room background        : will be generated")
+    print()
 
+    # ── Load SD pipeline ──────────────────────────────────────────────────────
+    pipe = _load_sd_pipeline(args.model)
+
+    # ── Generate room background (optional) ───────────────────────────────────
+    if args.room_bg:
+        room_path = os.path.join(args.faces_dir, "room_bg.png")
+        if os.path.isfile(room_path) and not args.regen:
+            print(f"[Room BG] Skipping — already exists: {room_path}")
+            print("          (use --regen to regenerate)")
+        else:
+            print("[Room BG] Generating room background …")
+            room_w = max(args.width  * 2, 1024)
+            room_h = max(args.height * 2, 576)
+            img = generate_image(
+                pipe, ROOM_PROMPT, ROOM_NEGATIVE,
+                room_w, room_h, args.steps, args.cfg
+            )
+            img.save(room_path)
+            print(f"[Room BG] ✓ Saved → {room_path}  ({img.size[0]}×{img.size[1]})\n")
+
+    # ── Generate character faces ───────────────────────────────────────────────
     for name, info in characters.items():
         role   = info.get("role",   "person")
         gender = info.get("gender", "neutral")
@@ -175,17 +186,18 @@ def main():
             continue
 
         print(f"[{name}] Generating {gender} {role} portrait …")
-        try:
-            prompt = portrait_prompt(name, role, gender)
-            img    = generate_image(prompt, args.model, args.width, args.height)
-            img.save(out)
-            print(f"[{name}] ✓ Saved → {out}  ({img.size[0]}×{img.size[1]})\n")
-        except Exception as e:
-            print(f"[{name}] ✗ Failed: {e}\n")
-            sys.exit(1)
+        prompt = portrait_prompt(name, role, gender)
+        print(f"  → Prompt: {prompt[:90]}…")
+
+        img = generate_image(
+            pipe, prompt, NEGATIVE,
+            args.width, args.height, args.steps, args.cfg
+        )
+        img.save(out)
+        print(f"[{name}] ✓ Saved → {out}  ({img.size[0]}×{img.size[1]})\n")
 
     print("Done! All face images generated.")
-    print(f"\nRun the pipeline:")
+    print(f"\nNext step — run the full pipeline:")
     print(f"  python main.py example_dialogue.json --output my_video.mp4")
 
 

@@ -19,10 +19,12 @@ soundfile>=0.12.1         # audio I/O (primary lip-sync signal source)
 gdown>=4.7.1              # Google Drive model downloader (used by setup_models.py)
 tqdm>=4.65.0
 
-# ── Ollama HTTP client ─────────────────────────────────────────────────────────
-# (uses built-in requests — no extra package needed)
-# Portrait generation uses Ollama image models (if available) or enhanced PIL.
-# No diffusers / HuggingFace / Stable Diffusion dependency required.
+# ── Stable Diffusion image generation ─────────────────────────────────────────
+diffusers>=0.29.0         # HuggingFace Diffusers (SD pipeline)
+transformers>=4.41.0      # tokenizers, CLIP text encoder
+accelerate>=0.30.0        # fast model loading / mixed-precision
+# torch is a prerequisite but installed separately (CUDA vs CPU variant):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
 # ── Wav2Lip native dependencies (installed via Wav2Lip/requirements.txt) ───────
 # numpy, opencv-python, torch, batch_face_detection, librosa, etc.

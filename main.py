@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-main.py — Text-to-Video with AI Portraits (Ollama + Wav2Lip)
+main.py — Text-to-Video with AI Portraits (Stable Diffusion + Wav2Lip)
 =======================================================================
 
 Full pipeline
 -------------
   1. Load dialogue JSON (characters + dialogue lines)
-  2. Ollama LLM  →  character appearance description (colours, style)
-  3. Ollama image model (if available) or enhanced PIL  →  portrait per character
+  2. Stable Diffusion  →  portrait per character (face_<name>.png)
+  3. Stable Diffusion  →  photorealistic room background
   4. For each dialogue line:
-       a. gTTS  →  TTS audio (.mp3)
+       a. gTTS  →  TTS audio (.mp3)  [deep male voice via ffmpeg pitch-shift]
        b. Wav2Lip (GPU)  →  lip-synced talking face video for the speaker
        c. Static face video  →  the listener (mouth closed)
   5. Compose side-by-side + subtitle bar  →  final MP4
@@ -18,14 +18,14 @@ Prerequisites
 -------------
   python setup_models.py        # clone Wav2Lip, download weights
   pip install -r requirements.txt
-  ollama serve                  # optional but recommended
 
 Usage
 -----
   python main.py example_dialogue.json
   python main.py my_script.json --output film.mp4 --fps 25
-  python main.py my_script.json --no-ollama          # skip Ollama descriptions
   python main.py my_script.json --regen-faces        # force regenerate faces
+  python main.py my_script.json --faces-dir my_faces # use pre-supplied face images
+  python main.py my_script.json --sd-model "stabilityai/stable-diffusion-2-1"
 """
 
 from __future__ import annotations
@@ -54,49 +54,69 @@ def banner(msg: str):
     print(f"\n{'─' * w}\n  {msg}\n{'─' * w}")
 
 
-def _load_face_images(char_names: list, faces_dir: str) -> dict:
+def _generate_missing_faces(
+    char_names: list,
+    char_data: dict,
+    faces_dir: str,
+    sd_model: str,
+    regen: bool,
+    width: int = 512,
+    height: int = 512,
+) -> dict:
     """
-    Load user-supplied face images from faces_dir.
-
-    Expected filenames (case-insensitive):
-        face_<name>.png / .jpg / .jpeg
-        e.g.  faces/face_alice.png   faces/face_bob.jpg
-
-    Aborts with a clear message listing exactly what files are missing.
+    For any character whose face_<name>.png doesn't exist (or --regen),
+    generate it with Stable Diffusion.  Returns {name: path}.
     """
-    face_paths = {}
-    missing    = []
-    extensions = [".png", ".jpg", ".jpeg", ".webp"]
+    from scene_generator import _sd_generate, PORTRAIT_NEGATIVE
 
     os.makedirs(faces_dir, exist_ok=True)
+    face_paths = {}
+    extensions = [".png", ".jpg", ".jpeg", ".webp"]
 
     for name in char_names:
         safe = name.lower().replace(" ", "_")
+
+        # Check if file already exists (any supported extension)
         found = None
         for ext in extensions:
             candidate = os.path.join(faces_dir, f"face_{safe}{ext}")
             if os.path.isfile(candidate):
                 found = candidate
                 break
-        if found:
-            print(f"  ✓ {name} → {found}")
-            face_paths[name] = found
-        else:
-            tried = ", ".join(f"face_{safe}{e}" for e in extensions)
-            missing.append(f"  • {faces_dir}/{tried}")
 
-    if missing:
-        msg = (
-            "\n[Error] Missing face image(s). "
-            f"Place your photos in the '{faces_dir}/' folder:\n"
-            + "\n".join(missing)
-            + f"\n\nExample:\n"
-            + "".join(
-                f"  cp /path/to/photo.jpg {faces_dir}/face_{n.lower().replace(' ','_')}.jpg\n"
-                for n in char_names if n not in face_paths
-            )
+        out_path = os.path.join(faces_dir, f"face_{safe}.png")
+
+        if found and not regen:
+            print(f"  ✓ {name} → {found}  (existing)")
+            face_paths[name] = found
+            continue
+
+        # Generate with Stable Diffusion
+        info   = char_data.get(name, {})
+        role   = info.get("role",   "person")
+        gender = info.get("gender", "neutral")
+
+        gw    = "man" if gender == "male" else "woman"
+        facing = "slightly right" if gender == "female" else "slightly left"
+        prompt = (
+            f"photorealistic portrait headshot of a {gw}, {role}, "
+            f"facing {facing}, natural friendly expression, "
+            f"professional business casual attire, "
+            f"soft studio lighting, shallow depth of field, sharp focus on face, "
+            f"plain light grey background, 4K DSLR quality, ultra realistic skin texture"
         )
-        sys.exit(msg)
+
+        print(f"  [SD] Generating face for '{name}' ({gender} {role}) …")
+        img = _sd_generate(prompt, PORTRAIT_NEGATIVE, width, height, model_id=sd_model)
+        if img is None:
+            sys.exit(
+                f"\n[Error] Stable Diffusion failed to generate face for '{name}'.\n"
+                f"  Make sure diffusers is installed and the model '{sd_model}' is available.\n"
+                f"  Or place your own photo at: {out_path}\n"
+            )
+        img.save(out_path)
+        print(f"  ✓ {name} → {out_path}")
+        face_paths[name] = out_path
 
     return face_paths
 
@@ -105,118 +125,101 @@ def _load_face_images(char_names: list, faces_dir: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a real-human talking-head video from a dialogue script."
+        description="Generate a talking-head video from a dialogue script using SD + Wav2Lip."
     )
-    parser.add_argument("script",              help="Dialogue JSON file")
-    parser.add_argument("--output",  "-o",     default="output.mp4")
-    parser.add_argument("--ollama-url",        default="http://localhost:11434")
-    parser.add_argument("--no-ollama",         action="store_true",
-                        help="Use built-in default appearances (skip Ollama)")
-    parser.add_argument("--faces-dir",         default="faces",
-                        help="Directory containing face images named "
-                             "face_<name>.png  (e.g. face_alice.png)")
-    parser.add_argument("--fps",     type=int, default=25)
-    parser.add_argument("--width",   type=int, default=1280)
-    parser.add_argument("--height",  type=int, default=720)
-    parser.add_argument("--lang",              default="en",
+    parser.add_argument("script",               help="Dialogue JSON file")
+    parser.add_argument("--output",  "-o",      default="output.mp4")
+    parser.add_argument("--sd-model",           default="runwayml/stable-diffusion-v1-5",
+                        help="HuggingFace model ID or local path for Stable Diffusion")
+    parser.add_argument("--faces-dir",          default="faces",
+                        help="Directory for face images (face_<name>.png). "
+                             "Missing faces are auto-generated with SD.")
+    parser.add_argument("--regen-faces",        action="store_true",
+                        help="Force regenerate all face images with SD")
+    parser.add_argument("--regen-room",         action="store_true",
+                        help="Force regenerate room background with SD")
+    parser.add_argument("--room-bg",            default=None,
+                        help="Path to a custom room background image (JPG/PNG). "
+                             "Uses SD generation if omitted.")
+    parser.add_argument("--fps",     type=int,  default=25)
+    parser.add_argument("--width",   type=int,  default=1280)
+    parser.add_argument("--height",  type=int,  default=720)
+    parser.add_argument("--lang",               default="en",
                         help="TTS language code (default: en)")
     parser.add_argument("--pause",   type=float, default=0.3,
                         help="Silence gap between dialogue lines in seconds")
     parser.add_argument("--no-gan",  action="store_true",
                         help="Use wav2lip.pth instead of wav2lip_gan.pth (faster)")
-    parser.add_argument("--room-bg", default=None,
-                        help="Path to a custom room background image (JPG/PNG). "
-                             "Uses built-in PIL office room if omitted.")
     args = parser.parse_args()
 
     # ── 1. Load script ────────────────────────────────────────────────────────
     banner("Loading dialogue script")
     data        = load_script(args.script)
     char_names  = list(data["characters"].keys())[:2]
+    char_data   = data["characters"]
     dialogue    = data["dialogue"]
     print(f"  Characters : {char_names}")
     print(f"  Lines      : {len(dialogue)}")
 
     # ── 2. Check Wav2Lip ──────────────────────────────────────────────────────
-    from wav2lip_runner import is_wav2lip_ready, WAV2LIP_DIR, WAV2LIP_CHECKPOINT
+    from wav2lip_runner import is_wav2lip_ready
     if not is_wav2lip_ready():
         print("\n[Warning] Wav2Lip is not set up. Run:  python setup_models.py")
         print("          Falling back to cartoon portrait mode for preview.\n")
         _run_cartoon_fallback(args, data, char_names, dialogue)
         return
 
-    # ── 3. Generate appearances via Ollama ────────────────────────────────────
-    banner("Generating character appearances (Ollama)")
-    from ollama_client import OllamaClient, DEFAULT_APPEARANCES
-    ollama     = OllamaClient(args.ollama_url)
-    use_ollama = (not args.no_ollama) and ollama.is_available()
-
-    if use_ollama:
-        print(f"  Ollama → {args.ollama_url}  model: {ollama.get_best_model()}")
-    else:
-        reason = "--no-ollama flag" if args.no_ollama else "not reachable"
-        print(f"  Ollama skipped ({reason}) — using default appearances")
-
-    appearances: dict = {}
-    for idx, name in enumerate(char_names):
-        info = data["characters"][name]
-        if use_ollama:
-            app = ollama.generate_appearance(
-                name=name,
-                role=info.get("role", "person"),
-                gender=info.get("gender", "neutral"),
-                default_idx=idx,
-            )
-        else:
-            app = DEFAULT_APPEARANCES[idx % len(DEFAULT_APPEARANCES)]
-        appearances[name] = app
-        print(f"  ✓ {name}: skin={app.get('skin_rgb')} hair={app.get('hair_rgb')}")
-
-    # ── 4. Load face images (user-supplied) ──────────────────────────────────
-    banner("Loading face images")
-    face_paths = _load_face_images(char_names, args.faces_dir)
-
-    # List of face paths in character order
+    # ── 3. Generate / load face images ───────────────────────────────────────
+    banner("Generating / loading face images (Stable Diffusion)")
+    face_paths    = _generate_missing_faces(
+        char_names, char_data, args.faces_dir,
+        sd_model=args.sd_model,
+        regen=args.regen_faces,
+        width=512, height=512,
+    )
     ordered_faces = [face_paths[n] for n in char_names]
 
-    # ── 4b. Generate scene assets with Ollama image model ────────────────────
-    banner("Generating scene (Ollama image model)")
-    from scene_generator import find_image_model, generate_room_background, generate_character_body
+    # ── 4. Generate room background ───────────────────────────────────────────
+    banner("Generating room background (Stable Diffusion)")
+    from scene_generator import generate_room_background
 
-    img_model = None
-    if use_ollama:
-        print("  Searching for Ollama image-generation model …")
-        img_model = find_image_model(args.ollama_url)
-        if img_model:
-            print(f"  ✓ Using image model: {img_model}")
-        else:
-            print("  No image-gen model found — using PIL room + face headshots")
+    # Delete cached file if --regen-room requested
+    if args.regen_room:
+        cache_path = os.path.join(args.faces_dir, "room_bg.png")
+        if os.path.isfile(cache_path):
+            os.remove(cache_path)
+            print(f"  Removed cached room background for regeneration.")
 
-    # Generate photorealistic room background once (cached to faces/room_bg.png)
     room_img = generate_room_background(
         width        = args.width,
-        height       = int(args.height * 0.85),   # room area (above subtitle)
-        ollama_url   = args.ollama_url,
-        image_model  = img_model,
+        height       = int(args.height * 0.85),
+        model_id     = args.sd_model,
         cache_dir    = args.faces_dir,
         room_bg_path = args.room_bg,
     )
 
-    # Optionally generate seated body images for each character
-    # (improves realism; falls back to headshot if generation fails)
+    # ── 5. Generate seated body images (optional enhancement) ─────────────────
+    banner("Generating character body images (Stable Diffusion)")
+    from scene_generator import generate_character_body
+
+    # Build default appearance data for body-image prompts
+    DEFAULT_APPEARANCES = [
+        {"skin_rgb": [235, 200, 170], "hair_rgb": [60, 40, 20],  "hair_style": "short"},
+        {"skin_rgb": [200, 165, 130], "hair_rgb": [140, 90, 50], "hair_style": "medium"},
+    ]
+
     char_body_paths: dict[str, str | None] = {}
     for idx, name in enumerate(char_names):
-        info  = data["characters"][name]
-        app   = appearances.get(name, {})
-        body  = generate_character_body(
+        info = char_data.get(name, {})
+        app  = DEFAULT_APPEARANCES[idx % len(DEFAULT_APPEARANCES)]
+        body = generate_character_body(
             name        = name,
-            role        = info.get("role", "person"),
+            role        = info.get("role",   "person"),
             gender      = info.get("gender", "neutral"),
             appearance  = app,
             width       = int(args.width * 0.38),
             height      = int(args.width * 0.38 * 1.28),
-            ollama_url  = args.ollama_url,
-            image_model = img_model,
+            model_id    = args.sd_model,
             cache_dir   = args.faces_dir,
             idx         = idx,
         )
@@ -225,22 +228,21 @@ def main():
             body_path = os.path.join(args.faces_dir, f"body_{safe}.png")
             char_body_paths[name] = body_path
         else:
-            char_body_paths[name] = None   # falls back to face headshot
+            char_body_paths[name] = None
 
-    # ── 5. Build dialogue segments ────────────────────────────────────────────
+    # ── 6. Build dialogue segments ────────────────────────────────────────────
     banner(f"Generating {len(dialogue)} dialogue segments")
-    from tts           import text_to_speech
-    from wav2lip_runner import run_wav2lip, make_listening_video
-    from video_composer import VideoComposer
-    from lip_sync       import get_audio_duration
+    from tts             import text_to_speech
+    from wav2lip_runner  import run_wav2lip
+    from video_composer  import VideoComposer
+    from lip_sync        import get_audio_duration
 
     composer   = VideoComposer(
         args.width, args.height, args.fps,
-        room_bg_image = room_img,
+        room_bg_image   = room_img,
         char_body_paths = char_body_paths,
     )
     clips      = []
-    temp_files = []
     tmp_dir    = tempfile.mkdtemp(prefix="ttv_")
 
     try:
@@ -257,40 +259,37 @@ def main():
 
             # ── TTS ───────────────────────────────────────────────────────────
             audio_path = os.path.join(tmp_dir, f"line_{line_idx:03d}_audio.mp3")
-            temp_files.append(audio_path)
             audio_path = text_to_speech(text, output_path=audio_path, lang=args.lang)
 
             duration = get_audio_duration(audio_path) + args.pause
 
             # ── Wav2Lip (talking face) ─────────────────────────────────────────
             wav2lip_out = os.path.join(tmp_dir, f"line_{line_idx:03d}_wav2lip.mp4")
-            temp_files.append(wav2lip_out)
             run_wav2lip(
-                face_image_path=speaker_face,
-                audio_path=audio_path,
-                output_path=wav2lip_out,
-                use_gan=not args.no_gan,
-                fps=args.fps,
-                pad_bottom=12,   # ensures chin/mouth not clipped
+                face_image_path = speaker_face,
+                audio_path      = audio_path,
+                output_path     = wav2lip_out,
+                use_gan         = not args.no_gan,
+                fps             = args.fps,
+                pad_bottom      = 12,
             )
 
             # ── compose segment ───────────────────────────────────────────────
             clip = composer.create_segment(
-                speaker_idx=speaker_idx,
-                dialogue_text=text,
-                speaker_name=speaker,
-                face_image_paths=ordered_faces,
-                wav2lip_video_path=wav2lip_out,
-                audio_path=audio_path,
+                speaker_idx       = speaker_idx,
+                dialogue_text     = text,
+                speaker_name      = speaker,
+                face_image_paths  = ordered_faces,
+                wav2lip_video_path= wav2lip_out,
+                audio_path        = audio_path,
             )
             clips.append(clip)
 
-        # ── 6. Concatenate & export ───────────────────────────────────────────
+        # ── 7. Concatenate & export ───────────────────────────────────────────
         banner(f"Exporting final video → {args.output}")
         VideoComposer.concat_and_write(clips, args.output, fps=args.fps)
 
     finally:
-        # Clean up temporary files
         import shutil
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -311,10 +310,9 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
     when Wav2Lip has not been set up yet.
     """
     print("  [Fallback] Running cartoon-portrait preview …")
-    from ollama_client     import OllamaClient, DEFAULT_APPEARANCES
     from character_renderer import CharacterRenderer
-    from tts               import text_to_speech
-    from lip_sync          import extract_mouth_openings
+    from tts                import text_to_speech
+    from lip_sync           import extract_mouth_openings
     import tempfile, numpy as np
 
     try:
@@ -322,24 +320,20 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
     except ImportError:
         from moviepy import VideoClip, AudioFileClip, concatenate_videoclips          # v2
 
-    ollama     = OllamaClient(args.ollama_url)
-    use_ollama = (not args.no_ollama) and ollama.is_available()
+    DEFAULT_APPEARANCES = [
+        {"skin_rgb": [235, 200, 170], "hair_rgb": [60, 40, 20],  "hair_style": "short"},
+        {"skin_rgb": [200, 165, 130], "hair_rgb": [140, 90, 50], "hair_style": "medium"},
+    ]
 
-    renderers  = []
+    renderers = []
     for idx, name in enumerate(char_names):
-        info = data["characters"][name]
-        app  = (
-            ollama.generate_appearance(name, info.get("role", "person"),
-                                       info.get("gender", "neutral"), idx)
-            if use_ollama
-            else DEFAULT_APPEARANCES[idx % len(DEFAULT_APPEARANCES)]
-        )
+        info = data["characters"].get(name, {})
+        app  = DEFAULT_APPEARANCES[idx % len(DEFAULT_APPEARANCES)]
         renderers.append(CharacterRenderer(name, app, ["left", "right"][idx]))
 
-    # Inline version of the old VideoComposer for cartoon frames
     from video_composer import _make_subtitle_image
-    fps = args.fps
-    W, H = args.width, args.height
+    fps    = args.fps
+    W, H   = args.width, args.height
     char_w = W // 2
     char_h = int(H * 0.85)
     sub_h  = H - char_h
@@ -348,9 +342,9 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
     tmp_files = []
 
     for line in dialogue:
-        speaker     = line["speaker"]
-        text        = line["text"]
-        spk_idx     = char_names.index(speaker) if speaker in char_names else 0
+        speaker  = line["speaker"]
+        text     = line["text"]
+        spk_idx  = char_names.index(speaker) if speaker in char_names else 0
 
         audio_path = tempfile.mktemp(suffix=".mp3")
         tmp_files.append(audio_path)
@@ -361,7 +355,7 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
 
         frames_np = []
         for fi in range(n_frames):
-            mo   = float(mouth_vals[fi])
+            mo    = float(mouth_vals[fi])
             frame = np.zeros((H, W, 3), dtype=np.uint8)
             frame[:] = [14, 17, 26]
             for i, r in enumerate(renderers):
@@ -375,7 +369,7 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
         def make_frame(t, _f=frames_np, _fps=fps):
             return _f[min(int(t * _fps), len(_f) - 1)]
 
-        clip = VideoClip(make_frame, duration=duration)
+        clip  = VideoClip(make_frame, duration=duration)
         audio = AudioFileClip(audio_path)
         try:
             clip = clip.with_audio(audio)

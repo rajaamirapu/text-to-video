@@ -392,7 +392,7 @@ class VideoComposer:
         else:
             room_bg = _get_room_bg(self.width, self.char_h, self.room_bg_path)
 
-        # Use Ollama-generated body image if available, else face headshot
+        # Use SD-generated body image if available, else face headshot
         listener_name = None  # we don't have name here; use path directly
         listener_img_path = face_image_paths[listener_idx]
         listener_face = Image.open(listener_img_path).convert("RGB")
