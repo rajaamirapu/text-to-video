@@ -258,7 +258,8 @@ def main():
             )
 
             # ── TTS ───────────────────────────────────────────────────────────
-            audio_path = os.path.join(tmp_dir, f"line_{line_idx:03d}_audio.mp3")
+            # text_to_speech always returns a WAV file (pitch-shifted PCM)
+            audio_path = os.path.join(tmp_dir, f"line_{line_idx:03d}_audio.wav")
             audio_path = text_to_speech(text, output_path=audio_path, lang=args.lang)
 
             duration = get_audio_duration(audio_path) + args.pause
