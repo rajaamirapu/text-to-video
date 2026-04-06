@@ -15,74 +15,58 @@ import tempfile
 
 # ── pitch shift ───────────────────────────────────────────────────────────────
 
-def _build_atempo_chain(rate: float) -> str:
+def _pitch_shift_deep(src: str, dst: str, rate: float = 0.85) -> bool:
     """
-    Build an ffmpeg atempo filter chain for the given pitch rate.
+    Lower the pitch of *src* audio and save to *dst* using ffmpeg.
 
-    ffmpeg's atempo filter is capped at [0.5, 2.0] per stage.
-    To restore the original duration after a pitch-down by `rate`,
-    we need tempo = 1/rate. If 1/rate > 2.0 we chain two atempo stages.
+    Technique
+    ---------
+    asetrate=44100*rate
+        Re-labels the stream as a lower sample rate WITHOUT resampling the
+        PCM data.  The audio sounds deeper (fewer Hz perceived per second)
+        and naturally a little slower — just like a record played at a lower
+        RPM.  No atempo / time-stretch is applied so there is zero speed
+        distortion.
 
-    Examples
-    --------
-    rate=0.85 → tempo=1.176 → "atempo=1.1765"
-    rate=0.75 → tempo=1.333 → "atempo=1.3333"
-    rate=0.60 → tempo=1.667 → "atempo=1.6667"
-    rate=0.50 → tempo=2.000 → "atempo=2.0000"          ← edge case, loud/fast
-    rate=0.45 → tempo=2.222 → "atempo=1.4907,atempo=1.4907"  ← two stages
-    """
-    target = 1.0 / rate
-    # Cap to a maximum of ~1.5× to avoid the rushed-voice effect.
-    # We deliberately do NOT fully compensate at extreme rates — a slight
-    # slow-down sounds natural for a deep voice; forcing 2× sounds robotic.
-    target = min(target, 1.5)
-    target = max(target, 0.5)
+    aresample=44100
+        Resamples the re-labelled stream back to the standard 44.1 kHz output
+        rate so media players handle it correctly.
 
-    if target <= 2.0:
-        return f"atempo={target:.4f}"
-    # Split into two stages so neither exceeds 2.0
-    stage = target ** 0.5
-    return f"atempo={stage:.4f},atempo={stage:.4f}"
+    Why NO atempo?
+    --------------
+    Adding `atempo=1/rate` to "restore" the original duration makes ffmpeg
+    time-stretch the audio, which is what caused the "voice going 2x fast"
+    problem.  A deep voice that is 15–20 % slower sounds completely natural
+    (think movie trailers, documentary narrators).  Forcing the duration back
+    to match the original creates a rushed, robotic artefact.
 
-
-def _pitch_shift_deep(src: str, dst: str, rate: float = 0.82) -> bool:
-    """
-    Lower the pitch of *src* audio using ffmpeg and save to *dst*.
-
-    How it works
-    ------------
-    asetrate=44100*rate  — reinterprets audio at a lower sample rate,
-                           making it sound deeper and slightly slower.
-    aresample=44100      — resamples back to 44.1 kHz (pitch stays low).
-    atempo=1/rate        — partially restores original duration
-                           (capped at 1.5× to avoid a sped-up robotic voice).
-
-    Recommended rates
-    -----------------
-    rate=0.90 → ~2 semitones lower → naturally warm male voice
-    rate=0.82 → ~3 semitones lower → confident broadcaster voice  ← default
-    rate=0.75 → ~5 semitones lower → deep/cinematic voice
-    rate=0.68 → ~6 semitones lower → very baritone (slow, may sound sleepy)
+    Rate guide
+    ----------
+    rate=0.92 → ~1.5 semitones lower → warm, authoritative male voice
+    rate=0.88 → ~2.5 semitones lower → confident broadcaster         ← default
+    rate=0.82 → ~3.5 semitones lower → deep / cinematic narration
+    rate=0.75 → ~5   semitones lower → very deep / baritone
     """
     try:
-        atempo_chain = _build_atempo_chain(rate)
-        af = f"asetrate=44100*{rate:.4f},aresample=44100,{atempo_chain}"
+        af = f"asetrate=44100*{rate:.4f},aresample=44100"
         cmd = [
             "ffmpeg", "-y", "-i", src,
             "-af", af,
             "-ar", "44100",
-            "-q:a", "2",   # slightly higher quality than before
+            "-q:a", "2",
             dst,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=30)
         if result.returncode != 0:
-            print(f"  [TTS] ffmpeg stderr: {result.stderr[-300:].decode(errors='replace')}")
-        return result.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
+            err = result.stderr[-400:].decode(errors="replace")
+            print(f"  [TTS] ffmpeg pitch-shift failed: {err}")
+            return False
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
     except FileNotFoundError:
         print("  [TTS] ffmpeg not found — skipping pitch shift")
         return False
     except Exception as e:
-        print(f"  [TTS] pitch-shift failed: {e}")
+        print(f"  [TTS] pitch-shift error: {e}")
         return False
 
 
@@ -92,7 +76,9 @@ def _gtts(text: str, path: str, lang: str = "en") -> bool:
     """Generate audio with Google TTS. Returns True on success."""
     try:
         from gtts import gTTS
-        tts = gTTS(text=text, lang=lang, slow=False)
+        # slow=True gives a more deliberate, measured pace which sounds
+        # natural when combined with the pitch-down step.
+        tts = gTTS(text=text, lang=lang, slow=True)
         tts.save(path)
         return os.path.exists(path) and os.path.getsize(path) > 0
     except Exception as e:
@@ -154,16 +140,17 @@ def text_to_speech(
     output_path: str | None = None,
     lang: str = "en",
     deep_voice: bool = True,
-    pitch_rate: float = 0.82,   # 0.82 ≈ 3 semitones lower → confident broadcaster voice
+    pitch_rate: float = 0.88,   # 0.88 ≈ 2.5 semitones lower → broadcaster voice
 ) -> str:
     """
     Convert *text* to a deep, masculine audio file.
 
     Strategy
     --------
-    1. gTTS  →  generate normal audio
-    2. ffmpeg pitch-shift down by (1 - pitch_rate) to make it deeper
-    3. Fallback: pyttsx3 with male voice  (no pitch shift needed)
+    1. gTTS  →  generate normal audio  (slow=True for measured pace)
+    2. ffmpeg  →  pitch-down via asetrate+aresample (NO atempo — avoids
+                  the "fast voice" artefact that time-stretching causes)
+    3. Fallback: pyttsx3 with male voice
     4. Fallback: silent WAV
 
     Parameters
@@ -171,9 +158,9 @@ def text_to_speech(
     text        : dialogue line to synthesise
     output_path : where to save; a temp file is created if None
     lang        : BCP-47 language code (gTTS)
-    deep_voice  : apply ffmpeg pitch-shift for deeper/manly voice
-    pitch_rate  : 0.90 = warm/natural, 0.82 = broadcaster (default),
-                  0.75 = cinematic deep, 0.68 = baritone
+    deep_voice  : apply ffmpeg pitch-shift for deeper voice
+    pitch_rate  : 0.92 = warm, 0.88 = broadcaster (default),
+                  0.82 = cinematic, 0.75 = very deep/baritone
     """
     if output_path is None:
         output_path = tempfile.mktemp(suffix=".mp3")
