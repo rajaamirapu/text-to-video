@@ -382,25 +382,35 @@ class VideoComposer:
         VideoFileClip, AudioFileClip, VideoClip, _ = _mp()
 
         talking      = VideoFileClip(wav2lip_video_path)
-        duration     = talking.duration
+        wav2lip_dur  = talking.duration
         listener_idx = 1 - speaker_idx
 
+        # Use audio duration as the master clock (Wav2Lip sometimes trims audio)
+        audio = None
+        audio_dur = wav2lip_dur
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            audio     = AudioFileClip(audio_path)
+            audio_dur = audio.duration
+
+        # Final segment duration = audio duration
+        duration = audio_dur
+
         # Pre-build static resources
-        # Use pre-generated image if available, else fall back to PIL/path
         if self.room_bg_image is not None:
             room_bg = self.room_bg_image.resize((self.width, self.char_h), Image.LANCZOS)
         else:
             room_bg = _get_room_bg(self.width, self.char_h, self.room_bg_path)
 
-        # Use SD-generated body image if available, else face headshot
-        listener_name = None  # we don't have name here; use path directly
         listener_img_path = face_image_paths[listener_idx]
-        listener_face = Image.open(listener_img_path).convert("RGB")
-        glow          = _speaker_glow(self.fw, self.fh)
-        subtitle      = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
+        listener_face     = Image.open(listener_img_path).convert("RGB")
+        glow              = _speaker_glow(self.fw, self.fh)
+        subtitle          = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
         def make_frame(t: float) -> np.ndarray:
-            spk_frame = talking.get_frame(t)
+            # Clamp t to Wav2Lip video duration so we never seek past end
+            safe_t    = min(t, wav2lip_dur - 1.0 / max(1, self.fps))
+            safe_t    = max(0.0, safe_t)
+            spk_frame = talking.get_frame(safe_t)
             return self._build_frame(
                 room_bg, listener_face, listener_idx,
                 spk_frame, speaker_idx,
@@ -410,8 +420,7 @@ class VideoComposer:
         clip = VideoClip(make_frame, duration=duration)
         clip = clip.with_fps(self.fps) if hasattr(clip, "with_fps") else clip.set_fps(self.fps)
 
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-            audio = AudioFileClip(audio_path)
+        if audio is not None:
             if audio.duration > duration:
                 try:
                     audio = audio.subclipped(0, duration)

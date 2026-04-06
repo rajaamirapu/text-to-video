@@ -331,7 +331,7 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
         app  = DEFAULT_APPEARANCES[idx % len(DEFAULT_APPEARANCES)]
         renderers.append(CharacterRenderer(name, app, ["left", "right"][idx]))
 
-    from video_composer import _make_subtitle_image
+    from video_composer import _subtitle_img  # noqa: F401
     fps    = args.fps
     W, H   = args.width, args.height
     char_w = W // 2
@@ -362,7 +362,7 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
                 is_active = (i == spk_idx)
                 char_img  = r.render(char_w, char_h, mo if is_active else 0.0, is_active)
                 frame[:char_h, i * char_w:(i + 1) * char_w] = np.asarray(char_img)
-            sub = _make_subtitle_image(W, sub_h, speaker, text)
+            sub = _subtitle_img(W, sub_h, speaker, text)
             frame[char_h:, :] = sub
             frames_np.append(frame)
 

@@ -64,6 +64,70 @@ def check_or_abort():
 
 # ── core inference ────────────────────────────────────────────────────────────
 
+def _ensure_wav_16k(audio_path: str, wav2lip_tmp_dir: str) -> str:
+    """
+    Convert audio to 16 kHz mono WAV — the exact format Wav2Lip expects.
+    If the input is already a .wav this still re-encodes to guarantee 16kHz mono.
+    Returns the path to the converted WAV.
+    """
+    out_wav = os.path.join(wav2lip_tmp_dir, "input_audio_16k.wav")
+    cmd = [
+        "ffmpeg", "-y", "-i", audio_path,
+        "-ar", "16000",      # 16 kHz sample rate (what Wav2Lip uses for mel)
+        "-ac", "1",          # mono
+        "-c:a", "pcm_s16le", # 16-bit PCM WAV
+        out_wav,
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=60)
+    if result.returncode == 0 and os.path.isfile(out_wav) and os.path.getsize(out_wav) > 0:
+        return out_wav
+    # ffmpeg failed — try with soundfile as fallback
+    try:
+        import soundfile as sf
+        import numpy as np
+        data, sr = sf.read(audio_path)
+        if data.ndim > 1:
+            data = data.mean(axis=1)   # stereo → mono
+        # simple resample via numpy linspace if not already 16k
+        if sr != 16000:
+            n_out = int(len(data) * 16000 / sr)
+            data  = np.interp(
+                np.linspace(0, len(data) - 1, n_out),
+                np.arange(len(data)),
+                data,
+            ).astype(np.float32)
+        sf.write(out_wav, data, 16000, subtype="PCM_16")
+        return out_wav
+    except Exception:
+        pass
+    # If all else fails return original path and let Wav2Lip try
+    return audio_path
+
+
+def _ensure_face_min_size(face_image_path: str, wav2lip_tmp_dir: str,
+                          min_size: int = 256) -> str:
+    """
+    Wav2Lip's S3FD face detector needs the face to be at least ~96 px wide
+    inside a ~256 px image. Return an upscaled copy if the source is tiny.
+    """
+    try:
+        from PIL import Image as _Img
+        img = _Img.open(face_image_path).convert("RGB")
+        w, h = img.size
+        if w < min_size or h < min_size:
+            scale  = max(min_size / w, min_size / h)
+            new_w  = max(min_size, int(w * scale))
+            new_h  = max(min_size, int(h * scale))
+            img    = img.resize((new_w, new_h), _Img.LANCZOS)
+            out    = os.path.join(wav2lip_tmp_dir, "face_upscaled.png")
+            img.save(out)
+            print(f"  [Wav2Lip] Face upscaled {w}×{h} → {new_w}×{new_h}")
+            return out
+    except Exception:
+        pass
+    return face_image_path
+
+
 def run_wav2lip(
     face_image_path: str,
     audio_path: str,
@@ -98,6 +162,23 @@ def run_wav2lip(
     """
     check_or_abort()
 
+    abs_wav2lip = os.path.abspath(WAV2LIP_DIR)
+
+    # Wav2Lip inference.py writes audio to temp/ relative to its cwd.
+    os.makedirs(os.path.join(abs_wav2lip, "temp"),    exist_ok=True)
+    os.makedirs(os.path.join(abs_wav2lip, "results"), exist_ok=True)
+
+    # ── Critical: convert audio to 16kHz mono WAV ────────────────────────────
+    # Wav2Lip's audio.py calls librosa.load(path, sr=16000) and assumes WAV.
+    # Passing MP3 / other formats often results in a static (no lip-sync) face.
+    tmp_audio_dir = os.path.join(abs_wav2lip, "temp")
+    wav_audio     = _ensure_wav_16k(os.path.abspath(audio_path), tmp_audio_dir)
+
+    # ── Ensure face is large enough for S3FD detection ───────────────────────
+    face_image_path = _ensure_face_min_size(
+        os.path.abspath(face_image_path), tmp_audio_dir
+    )
+
     # Choose checkpoint
     checkpoint = WAV2LIP_CHECKPOINT
     if not use_gan:
@@ -107,16 +188,20 @@ def run_wav2lip(
 
     inference_script = os.path.abspath(os.path.join(WAV2LIP_DIR, "inference.py"))
     checkpoint       = os.path.abspath(checkpoint)
-    face_image_path  = os.path.abspath(face_image_path)
-    audio_path       = os.path.abspath(audio_path)
     output_path      = os.path.abspath(output_path)
+
+    # Detect whether input is a static image — Wav2Lip handles images and
+    # videos differently; for a single image we set --static True so it
+    # doesn't try to loop through non-existent video frames.
+    img_exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    is_image = os.path.splitext(face_image_path)[1].lower() in img_exts
 
     cmd = [
         sys.executable,     # same Python that runs this script
         inference_script,
         "--checkpoint_path", checkpoint,
         "--face",            face_image_path,
-        "--audio",           audio_path,
+        "--audio",           wav_audio,           # ← always a 16kHz WAV now
         "--outfile",         output_path,
         "--resize_factor",   str(resize_factor),
         "--fps",             str(fps),
@@ -124,20 +209,17 @@ def run_wav2lip(
         "--face_det_batch_size", "4",
         "--wav2lip_batch_size",  "128",
     ]
+    if is_image:
+        cmd += ["--static", "True"]   # critical for single-image input
     if nosmooth:
         cmd.append("--nosmooth")
 
     env = os.environ.copy()
     # Add Wav2Lip dir to PYTHONPATH so its internal imports resolve
-    abs_wav2lip = os.path.abspath(WAV2LIP_DIR)
     env["PYTHONPATH"] = abs_wav2lip + os.pathsep + env.get("PYTHONPATH", "")
 
-    # Wav2Lip inference.py writes audio to temp/temp.wav relative to its cwd.
-    # Create the temp/ and results/ dirs now so the subprocess doesn't crash.
-    os.makedirs(os.path.join(abs_wav2lip, "temp"),    exist_ok=True)
-    os.makedirs(os.path.join(abs_wav2lip, "results"), exist_ok=True)
-
     print(f"  [Wav2Lip] Running inference …  face={os.path.basename(face_image_path)}")
+    print(f"  [Wav2Lip] Audio: {os.path.basename(wav_audio)}  (16kHz WAV)")
     result = subprocess.run(
         cmd,
         cwd=abs_wav2lip,
@@ -145,7 +227,16 @@ def run_wav2lip(
         capture_output=True,
         text=True,
     )
+
+    # ── Print output for debugging ────────────────────────────────────────────
+    if result.stdout.strip():
+        # Show last few lines of stdout (Wav2Lip prints progress there)
+        last_lines = result.stdout.strip().splitlines()[-6:]
+        for line in last_lines:
+            print(f"  [Wav2Lip] {line}")
+
     if result.returncode != 0:
+        print("  [Wav2Lip] STDOUT:", result.stdout[-800:])
         print("  [Wav2Lip] STDERR:", result.stderr[-1500:])
         raise RuntimeError(
             f"Wav2Lip inference failed (exit code {result.returncode}).\n"
@@ -163,7 +254,7 @@ def run_wav2lip(
             )
 
     sz = os.path.getsize(output_path)
-    print(f"  [Wav2Lip] Done → {output_path}  ({sz // 1024} KB)")
+    print(f"  [Wav2Lip] ✓ Done → {output_path}  ({sz // 1024} KB)")
     return output_path
 
 
