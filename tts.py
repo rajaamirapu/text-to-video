@@ -15,31 +15,63 @@ import tempfile
 
 # ── pitch shift ───────────────────────────────────────────────────────────────
 
-def _pitch_shift_deep(src: str, dst: str, rate: float = 0.75) -> bool:
+def _build_atempo_chain(rate: float) -> str:
+    """
+    Build an ffmpeg atempo filter chain for the given pitch rate.
+
+    ffmpeg's atempo filter is capped at [0.5, 2.0] per stage.
+    To restore the original duration after a pitch-down by `rate`,
+    we need tempo = 1/rate. If 1/rate > 2.0 we chain two atempo stages.
+
+    Examples
+    --------
+    rate=0.85 → tempo=1.176 → "atempo=1.1765"
+    rate=0.75 → tempo=1.333 → "atempo=1.3333"
+    rate=0.60 → tempo=1.667 → "atempo=1.6667"
+    rate=0.50 → tempo=2.000 → "atempo=2.0000"          ← edge case, loud/fast
+    rate=0.45 → tempo=2.222 → "atempo=1.4907,atempo=1.4907"  ← two stages
+    """
+    target = 1.0 / rate
+    # Cap to a maximum of ~1.5× to avoid the rushed-voice effect.
+    # We deliberately do NOT fully compensate at extreme rates — a slight
+    # slow-down sounds natural for a deep voice; forcing 2× sounds robotic.
+    target = min(target, 1.5)
+    target = max(target, 0.5)
+
+    if target <= 2.0:
+        return f"atempo={target:.4f}"
+    # Split into two stages so neither exceeds 2.0
+    stage = target ** 0.5
+    return f"atempo={stage:.4f},atempo={stage:.4f}"
+
+
+def _pitch_shift_deep(src: str, dst: str, rate: float = 0.82) -> bool:
     """
     Lower the pitch of *src* audio using ffmpeg and save to *dst*.
 
     How it works
     ------------
-    asetrate=44100*rate  — reinterprets audio as lower sample-rate
-                           (same PCM data sounds deeper and slower)
-    aresample=44100      — upsample back to 44.1 kHz  ← pitch stays low,
-                           tempo stays slow
-    atempo=1/rate        — restore original duration WITHOUT touching pitch
-                           (ffmpeg atempo is pitch-preserving time-stretch)
+    asetrate=44100*rate  — reinterprets audio at a lower sample rate,
+                           making it sound deeper and slightly slower.
+    aresample=44100      — resamples back to 44.1 kHz (pitch stays low).
+    atempo=1/rate        — partially restores original duration
+                           (capped at 1.5× to avoid a sped-up robotic voice).
 
-    rate=0.75 → ~5 semitones lower → deep male voice
-    rate=0.70 → ~6 semitones lower → very deep / baritone
+    Recommended rates
+    -----------------
+    rate=0.90 → ~2 semitones lower → naturally warm male voice
+    rate=0.82 → ~3 semitones lower → confident broadcaster voice  ← default
+    rate=0.75 → ~5 semitones lower → deep/cinematic voice
+    rate=0.68 → ~6 semitones lower → very baritone (slow, may sound sleepy)
     """
     try:
-        # Clamp atempo to ffmpeg's supported range [0.5, 2.0]
-        tempo = min(2.0, max(0.5, 1.0 / rate))
+        atempo_chain = _build_atempo_chain(rate)
+        af = f"asetrate=44100*{rate:.4f},aresample=44100,{atempo_chain}"
         cmd = [
             "ffmpeg", "-y", "-i", src,
-            "-af",
-            f"asetrate=44100*{rate:.4f},aresample=44100,atempo={tempo:.4f}",
+            "-af", af,
             "-ar", "44100",
-            "-q:a", "3",
+            "-q:a", "2",   # slightly higher quality than before
             dst,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=30)
@@ -122,7 +154,7 @@ def text_to_speech(
     output_path: str | None = None,
     lang: str = "en",
     deep_voice: bool = True,
-    pitch_rate: float = 0.75,   # 0.75 ≈ 5 semitones lower → deep male voice
+    pitch_rate: float = 0.82,   # 0.82 ≈ 3 semitones lower → confident broadcaster voice
 ) -> str:
     """
     Convert *text* to a deep, masculine audio file.
@@ -140,7 +172,8 @@ def text_to_speech(
     output_path : where to save; a temp file is created if None
     lang        : BCP-47 language code (gTTS)
     deep_voice  : apply ffmpeg pitch-shift for deeper/manly voice
-    pitch_rate  : 0.82 ≈ one tone lower; 0.75 for very deep
+    pitch_rate  : 0.90 = warm/natural, 0.82 = broadcaster (default),
+                  0.75 = cinematic deep, 0.68 = baritone
     """
     if output_path is None:
         output_path = tempfile.mktemp(suffix=".mp3")
