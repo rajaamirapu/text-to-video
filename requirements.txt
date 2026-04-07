@@ -5,7 +5,8 @@ numpy>=1.26.0,<2.0
 requests>=2.31.0
 
 # ── Audio / TTS ────────────────────────────────────────────────────────────────
-gTTS>=2.3.2               # Google TTS (requires internet)
+edge-tts>=6.1.9           # Microsoft neural TTS — natural male voices (primary)
+gTTS>=2.3.2               # Google TTS (fallback, requires internet)
 pyttsx3>=2.90             # offline TTS fallback
 soundfile>=0.12.1         # audio I/O (primary lip-sync signal source)
 
