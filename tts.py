@@ -257,19 +257,22 @@ def text_to_speech(
     base    = os.path.splitext(output_path)[0]
     wav_out = base + ".wav"
 
-    # 1. edge-tts
+    # 1. edge-tts  (Microsoft neural — best quality)
     if _edge_tts(text, wav_out):
         return wav_out
 
     # 2. gTTS + pitch-down
+    print("  [TTS] edge-tts unavailable, trying gTTS …")
     if _gtts_wav(text, wav_out, lang=lang, pitch_rate=pitch_rate):
         return wav_out
 
     # 3. pyttsx3
+    print("  [TTS] gTTS unavailable, trying pyttsx3 …")
     if _pyttsx3_wav(text, wav_out):
         return wav_out
 
-    # 4. silent
+    # 4. silent — pipeline won't crash but voice will be missing
+    print(f"  [TTS] ⚠ ALL engines failed — producing silent audio for: \"{text[:50]}\"")
     duration = max(1.5, len(text.split()) / 120 * 60)
     _silent_wav(duration, wav_out)
     return wav_out

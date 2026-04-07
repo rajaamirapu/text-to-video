@@ -305,6 +305,26 @@ def _subtitle_img(width: int, height: int, speaker: str, text: str) -> Image.Ima
 # Per-character phase offsets so the two people animate independently
 _CHAR_PHASE = [0.0, math.pi * 0.61]   # irrational fraction → never in sync
 
+# Sip timing
+_SIP_PERIOD_LISTEN  = 5.0   # listener sips every ~5 s
+_SIP_PERIOD_SPEAK   = 8.0   # speaker sips every ~8 s (between sentences)
+_SIP_DURATION       = 1.8   # total rise-hold-lower time per sip
+
+
+def _sip_lift(t: float, char_idx: int, is_speaking: bool) -> float:
+    """
+    Returns 0.0 (cup at hand) → 1.0 (cup at mouth).
+    Uses a smooth sine bell so the motion feels natural.
+    The listener sips more often than the speaker.
+    """
+    period = _SIP_PERIOD_SPEAK if is_speaking else _SIP_PERIOD_LISTEN
+    # Stagger each character by their phase so they never sip simultaneously
+    offset     = _CHAR_PHASE[char_idx % 2] / (2 * math.pi) * period
+    t_in_cycle = (t + offset) % period
+    if t_in_cycle >= _SIP_DURATION:
+        return 0.0
+    return math.sin(math.pi * t_in_cycle / _SIP_DURATION)   # smooth 0→1→0
+
 
 def _breathing_scale(t: float, char_idx: int, is_speaking: bool) -> float:
     """
@@ -370,73 +390,91 @@ def _draw_coffee_cup(
     size: int = 38,
     t: float = 0.0,
     char_idx: int = 0,
+    lift: float = 0.0,
 ) -> None:
     """
-    Draw a warm ceramic coffee mug held by the character at (cx, cy).
+    Draw a warm ceramic coffee mug.
+
+    Parameters
+    ----------
+    cx, cy   : rest position (hand level)
+    lift     : 0.0 = cup at hand, 1.0 = cup raised to mouth
+               The face is composited AFTER the cup, so at lift≈1 the face
+               naturally occludes the upper rim — looks like drinking.
 
     Animated elements
     -----------------
-    • Cup bobs gently with the breathing rhythm.
-    • Steam wisps drift upward and fade in/out.
-    • Coffee surface ripples very slightly.
+    • Cup bobs gently with breathing when at rest.
+    • Cup tilts forward during the sip (visible at the rim as it tilts).
+    • Steam wisps only visible when cup is at rest (0 steam while sipping).
     """
-    phase     = _CHAR_PHASE[char_idx % 2]
-    bob       = int(3 * math.sin(2 * math.pi * 0.25 * t + phase))  # sync with breathing
-    cx_f      = cx
-    cy_f      = cy + bob
+    phase = _CHAR_PHASE[char_idx % 2]
+    # Only bob when at rest; suppress bob while lifting
+    bob   = int(3 * (1 - lift) * math.sin(2 * math.pi * 0.25 * t + phase))
 
-    mw   = size
-    mh   = int(size * 1.15)
-    x0   = cx_f - mw // 2
-    y0   = cy_f - mh // 2
-    x1   = x0 + mw
-    y1   = y0 + mh
+    cx_f  = cx
+    cy_f  = cy + bob    # vertical position already set by caller when sipping
+
+    mw    = size
+    mh    = int(size * 1.15)
+
+    # When sipping, compress mh slightly (simulates forward tilt of cup)
+    tilt_squeeze = 1.0 - 0.25 * lift   # 1.0 → 0.75 at peak sip
+    mh_draw      = max(4, int(mh * tilt_squeeze))
+
+    x0 = cx_f - mw // 2
+    y0 = cy_f - mh_draw // 2
+    x1 = x0 + mw
+    y1 = y0 + mh_draw
 
     draw = ImageDraw.Draw(canvas, "RGBA")
 
-    # ── Mug body (warm white ceramic) ────────────────────────────────────────
+    # ── Mug body ────────────────────────────────────────────────────────────
     draw.rounded_rectangle(
-        [x0, y0, x1, y1], radius=5,
-        fill=(245, 240, 230, 230),
-        outline=(160, 150, 135, 200), width=2,
+        [x0, y0, x1, y1], radius=max(2, int(5 * tilt_squeeze)),
+        fill=(245, 240, 230, 235),
+        outline=(160, 150, 135, 210), width=2,
     )
 
-    # ── Coffee inside (dark brown liquid) ────────────────────────────────────
-    inner_pad = 4
-    lip_h     = 7
+    # ── Coffee inside — extra visible when tilted toward viewer ─────────────
+    inner_pad = 3
+    lip_h     = max(4, int((7 + 8 * lift) * tilt_squeeze))  # opens wider when tilted
     draw.ellipse(
         [x0 + inner_pad, y0 + inner_pad,
          x1 - inner_pad, y0 + inner_pad + lip_h],
-        fill=(80, 48, 22, 230),
+        fill=(75, 44, 18, 240),
     )
-    # Tiny highlight on coffee surface
+    # Highlight
     hi_x = x0 + inner_pad + 4
-    draw.ellipse([hi_x, y0 + inner_pad + 1, hi_x + 6, y0 + inner_pad + 4],
-                 fill=(140, 100, 60, 160))
+    draw.ellipse([hi_x, y0 + inner_pad + 1, hi_x + 5, y0 + inner_pad + 4],
+                 fill=(140, 100, 60, 150))
 
-    # ── Handle ────────────────────────────────────────────────────────────────
-    hx0, hx1 = x1 - 2, x1 + int(size * 0.38)
-    hym      = (y0 + y1) // 2
-    draw.arc([hx0, hym - mh // 4, hx1, hym + mh // 4],
-             start=-90, end=90, fill=(160, 150, 135, 220), width=3)
+    # ── Handle (hidden during deep tilt) ────────────────────────────────────
+    handle_alpha = int(220 * (1 - lift * 0.7))
+    if handle_alpha > 20:
+        hx0 = x1 - 2
+        hx1 = x1 + int(size * 0.38)
+        hym = (y0 + y1) // 2
+        draw.arc([hx0, hym - mh_draw // 4, hx1, hym + mh_draw // 4],
+                 start=-90, end=90,
+                 fill=(160, 150, 135, handle_alpha), width=3)
 
-    # ── Steam wisps ───────────────────────────────────────────────────────────
-    steam_period = 2.4
-    steam_t      = (t % steam_period) / steam_period   # 0 → 1 cycle
-    n_wisps      = 3
-    for i in range(n_wisps):
-        wt    = (steam_t + i / n_wisps) % 1.0          # each wisp offset
-        alpha = int(180 * math.sin(math.pi * wt))      # fade in/out
-        if alpha < 10:
-            continue
-        rise  = int(wt * 22)                            # how high it's risen
-        wx    = cx_f + int(5 * math.sin(2 * math.pi * wt + i)) + (i - 1) * 6
-        wy    = y0 - 3 - rise
-        ws    = max(1, 4 - int(wt * 3))                # wisp shrinks as it rises
-        draw.ellipse(
-            [wx - ws, wy - ws, wx + ws, wy + ws],
-            fill=(210, 210, 210, alpha),
-        )
+    # ── Steam wisps — only when cup is at rest (not sipping) ─────────────────
+    steam_alpha_scale = max(0.0, 1.0 - lift * 2.5)   # fades out as cup lifts
+    if steam_alpha_scale > 0.05:
+        steam_period = 2.4
+        steam_t      = (t % steam_period) / steam_period
+        for i in range(3):
+            wt    = (steam_t + i / 3) % 1.0
+            alpha = int(170 * steam_alpha_scale * math.sin(math.pi * wt))
+            if alpha < 10:
+                continue
+            rise = int(wt * 20)
+            wx   = cx_f + int(4 * math.sin(2 * math.pi * wt + i)) + (i - 1) * 6
+            wy   = y0 - 3 - rise
+            ws   = max(1, 4 - int(wt * 3))
+            draw.ellipse([wx - ws, wy - ws, wx + ws, wy + ws],
+                         fill=(215, 215, 215, alpha))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,12 +515,17 @@ class VideoComposer:
 
         # Coffee-cup anchor — below & slightly inward from each character centre
         cup_off_x = int(self.fw * 0.22)   # inward horizontal offset
-        cup_off_y = int(self.fh * 0.40)   # below face centre
-        self.cup_centres = [
-            (cx_l + cup_off_x,  cy + cup_off_y),   # left character holds cup to right
-            (cx_r - cup_off_x,  cy + cup_off_y),   # right character holds cup to left
+        cup_rest_y = cy + int(self.fh * 0.40)   # hand/lap level
+        cup_mouth_y = cy + int(self.fh * 0.13)  # mouth/chin level
+        self.cup_rest = [
+            (cx_l + cup_off_x, cup_rest_y),
+            (cx_r - cup_off_x, cup_rest_y),
         ]
-        self.cup_size = max(28, int(self.fw * 0.11))
+        self.cup_mouth = [
+            (cx_l + int(cup_off_x * 0.4), cup_mouth_y),
+            (cx_r - int(cup_off_x * 0.4), cup_mouth_y),
+        ]
+        self.cup_size = max(30, int(self.fw * 0.115))
 
     # ── build one composite PIL image (room + both faces + animation) ─────────
 
@@ -501,7 +544,20 @@ class VideoComposer:
 
         canvas = room_bg.convert("RGBA")
 
-        # ── 1. Listener — animated portrait ──────────────────────────────────
+        # ── 1. Coffee cups FIRST — faces composited on top ────────────────────
+        # Drawing order: cup → face ensures the face naturally covers the cup
+        # when it's raised to mouth level (looks like drinking).
+        for char_idx, is_spk in ((listener_idx, False), (speaker_idx, True)):
+            lift        = _sip_lift(t, char_idx, is_spk)
+            rx, ry      = self.cup_rest[char_idx]
+            mx, my      = self.cup_mouth[char_idx]
+            cup_cx      = int(rx + lift * (mx - rx))
+            cup_cy      = int(ry + lift * (my - ry))
+            _draw_coffee_cup(canvas, cup_cx, cup_cy,
+                             size=self.cup_size, t=t,
+                             char_idx=char_idx, lift=lift)
+
+        # ── 2. Listener — animated portrait (on top of cup) ──────────────────
         lcx, lcy = self.centres[listener_idx]
         nod_dy   = _listener_nod(t, listener_idx)
         l_face, ldx, ldy = _animate_face(
@@ -511,14 +567,14 @@ class VideoComposer:
                     lcx + ldx, lcy + ldy + nod_dy,
                     l_face.width, l_face.height)
 
-        # ── 2. Speaker glow halo ──────────────────────────────────────────────
+        # ── 3. Speaker glow halo ──────────────────────────────────────────────
         scx, scy = self.centres[speaker_idx]
         sdx, sdy = _sway_offset(t, speaker_idx, is_speaking=True)
         gx = scx - self.fw // 2 + sdx
         gy = scy - self.fh // 2 + sdy
         canvas.alpha_composite(glow, (max(0, gx), max(0, gy)))
 
-        # ── 3. Speaker — Wav2Lip frame + breathing scale ──────────────────────
+        # ── 4. Speaker — Wav2Lip frame + breathing scale ──────────────────────
         scale = _breathing_scale(t, speaker_idx, is_speaking=True)
         spk_img = Image.fromarray(speaker_frame)
         sw = max(1, int(self.fw * scale))
@@ -527,13 +583,7 @@ class VideoComposer:
         _blend_face(canvas, spk_img,
                     scx + sdx, scy + sdy, sw, sh)
 
-        # ── 4. Coffee cups with steam animation ──────────────────────────────
-        for char_idx in (listener_idx, speaker_idx):
-            cup_cx, cup_cy = self.cup_centres[char_idx]
-            _draw_coffee_cup(canvas, cup_cx, cup_cy,
-                             size=self.cup_size, t=t, char_idx=char_idx)
-
-        # ── 5. Composite into full frame (room area + subtitle bar) ──────────
+        # ── 5. Full frame composite ───────────────────────────────────────────
         full = Image.new("RGB", (self.width, self.height), (10, 8, 16))
         full.paste(canvas.convert("RGB"), (0, 0))
         full.paste(subtitle, (0, self.char_h))
@@ -557,15 +607,27 @@ class VideoComposer:
         wav2lip_dur  = talking.duration
         listener_idx = 1 - speaker_idx
 
-        # Use audio duration as the master clock (Wav2Lip sometimes trims audio)
-        audio = None
+        # ── Load audio — voice must always be present ─────────────────────────
+        # Use the TTS WAV as the master clock; Wav2Lip video frames are clamped.
+        audio     = None
         audio_dur = wav2lip_dur
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-            audio     = AudioFileClip(audio_path)
-            audio_dur = audio.duration
 
-        # Final segment duration = audio duration
-        duration = audio_dur
+        if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 256):
+            print(f"  [Composer] ⚠ Audio file missing/empty: {audio_path}")
+        else:
+            try:
+                audio = AudioFileClip(audio_path)
+                if audio.duration < 0.05:
+                    print(f"  [Composer] ⚠ Audio too short ({audio.duration:.3f}s) — voice may be missing")
+                    audio = None
+                else:
+                    audio_dur = audio.duration
+                    print(f"  [Composer] Audio loaded: {audio.duration:.2f}s")
+            except Exception as exc:
+                print(f"  [Composer] ⚠ Could not load audio {audio_path}: {exc}")
+                audio = None
+
+        duration = max(audio_dur, 0.5)
 
         # Pre-build static resources
         if self.room_bg_image is not None:
@@ -594,15 +656,19 @@ class VideoComposer:
         clip = clip.with_fps(self.fps) if hasattr(clip, "with_fps") else clip.set_fps(self.fps)
 
         if audio is not None:
-            if audio.duration > duration:
+            # Trim audio to video duration if longer
+            if audio.duration > duration + 0.05:
                 try:
                     audio = audio.subclipped(0, duration)
                 except AttributeError:
                     audio = audio.subclip(0, duration)
+            # Attach audio — try both MoviePy v1 and v2 API
             try:
                 clip = clip.with_audio(audio)
             except AttributeError:
                 clip = clip.set_audio(audio)
+        else:
+            print(f"  [Composer] ⚠ Segment has no audio — check TTS output")
 
         return clip
 
