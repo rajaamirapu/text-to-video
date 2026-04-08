@@ -299,6 +299,186 @@ def _subtitle_img(width: int, height: int, speaker: str, text: str) -> Image.Ima
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Emotion detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EMOTION_KEYWORDS: dict[str, list[str]] = {
+    "excited":    ["incredible", "amazing", "wow", "fantastic", "revolutionary",
+                   "breakthrough", "huge", "awesome", "brilliant", "great",
+                   "exciting", "wonderful", "magnificent", "outstanding"],
+    "surprised":  ["really", "seriously", "no way", "impossible", "unbelievable",
+                   "shocked", "never", "unexpected", "whoa", "wait", "what"],
+    "happy":      ["thanks", "love", "happy", "pleased", "glad", "delighted",
+                   "perfect", "excellent", "congratulations", "great question",
+                   "of course", "hello", "welcome"],
+    "curious":    ["how", "why", "when", "explain", "tell me", "interesting",
+                   "wonder", "question", "mean", "does", "can you", "what about"],
+    "thoughtful": ["think", "perhaps", "maybe", "consider", "believe", "actually",
+                   "complex", "future", "plan", "planning", "developing", "analyse"],
+}
+
+
+def _detect_emotion(text: str) -> str:
+    """Return the dominant emotion for a line of dialogue using keyword matching."""
+    low = text.lower()
+    scores = {emo: sum(1 for kw in kws if kw in low)
+              for emo, kws in _EMOTION_KEYWORDS.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "neutral"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Expression overlays  (drawn on the LISTENER in reaction to what's being said)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _draw_expression(
+    canvas: Image.Image,
+    cx: int, cy: int,
+    fw: int, fh: int,
+    emotion: str,
+    t: float,
+    char_idx: int,
+) -> None:
+    """
+    Draw animated expression overlays on the canvas at the listener's face
+    position.  All elements are drawn using PIL arcs/lines/ellipses so no
+    external assets are needed.
+
+    Expressions
+    -----------
+    excited    → arched raised brows  +  animated pink blush
+    surprised  → wide raised brows    +  sweat drop
+    happy      → smile arc            +  soft cheek blush
+    curious    → one raised brow (quizzical)
+    thoughtful → furrowed / angled brows
+    neutral    → no overlay
+    """
+    if emotion == "neutral":
+        return
+
+    draw  = ImageDraw.Draw(canvas)
+    phase = _CHAR_PHASE[char_idx % 2]
+
+    # Key face landmarks (approximate, based on oval portrait framing)
+    brow_y  = cy - int(fh * 0.22)          # eyebrow arch
+    eye_y   = cy - int(fh * 0.12)          # eye line
+    cheek_y = cy + int(fh * 0.06)          # cheek / smile region
+    eye_sep = int(fw * 0.20)               # half-gap between eye centres
+    bw      = int(fw * 0.13)               # half-width of one brow arc
+    bh      = int(fh * 0.05)               # height of brow arc box
+
+    if emotion == "excited":
+        pulse      = 0.7 + 0.3 * math.sin(2 * math.pi * 1.5 * t + phase)
+        brow_lift  = int(10 * pulse)
+        # Both brows arched high
+        for sign in (-1, 1):
+            ecx = cx + sign * eye_sep
+            draw.arc(
+                [ecx - bw, brow_y - brow_lift - bh,
+                 ecx + bw, brow_y - brow_lift + bh],
+                start=200, end=340, fill=(30, 20, 12), width=3,
+            )
+        # Animated blush circles on cheeks
+        blush_r = int(fw * 0.09)
+        blush_a = int(130 * pulse)
+        bl = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        bd = ImageDraw.Draw(bl)
+        for sign in (-1, 1):
+            bcx = cx + sign * int(eye_sep * 1.8)
+            bd.ellipse([bcx - blush_r, cheek_y - blush_r,
+                        bcx + blush_r, cheek_y + blush_r],
+                       fill=(255, 110, 110, blush_a))
+        canvas.alpha_composite(bl)
+
+    elif emotion == "surprised":
+        pulse      = abs(math.sin(2 * math.pi * 0.9 * t + phase))
+        brow_lift  = int(14 * pulse)
+        # Both brows raised high with slight arch
+        for sign in (-1, 1):
+            ecx = cx + sign * eye_sep
+            draw.arc(
+                [ecx - bw, brow_y - brow_lift - int(bh * 1.4),
+                 ecx + bw, brow_y - brow_lift + int(bh * 0.6)],
+                start=195, end=345, fill=(20, 14, 8), width=4,
+            )
+        # Animated sweat drop
+        sd_x     = cx + int(fw * 0.38)
+        sd_y     = brow_y - brow_lift - int(fh * 0.06)
+        drop_sz  = int(fw * 0.045)
+        drop_a   = int(220 * pulse)
+        dl = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        dd = ImageDraw.Draw(dl)
+        # teardrop: oval body + triangle tip above
+        dd.ellipse([sd_x, sd_y + drop_sz // 2,
+                    sd_x + drop_sz, sd_y + drop_sz * 2],
+                   fill=(80, 170, 255, drop_a))
+        dd.polygon([(sd_x + drop_sz // 2, sd_y),
+                    (sd_x,                sd_y + drop_sz // 2 + 2),
+                    (sd_x + drop_sz,      sd_y + drop_sz // 2 + 2)],
+                   fill=(80, 170, 255, drop_a))
+        canvas.alpha_composite(dl)
+
+    elif emotion == "happy":
+        pulse     = 0.75 + 0.25 * math.sin(2 * math.pi * 0.55 * t + phase)
+        # Upward smile arc near mouth level
+        smile_y   = cy + int(fh * 0.14)
+        smile_w   = int(fw * 0.26)
+        smile_h   = int(fh * 0.07)
+        draw.arc(
+            [cx - smile_w, smile_y - smile_h,
+             cx + smile_w, smile_y + smile_h],
+            start=10, end=170, fill=(190, 70, 70), width=3,
+        )
+        # Soft cheek blush
+        blush_r = int(fw * 0.07)
+        blush_a = int(85 * pulse)
+        bl = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        bd = ImageDraw.Draw(bl)
+        for sign in (-1, 1):
+            bcx = cx + sign * int(eye_sep * 1.7)
+            bd.ellipse([bcx - blush_r, cheek_y - blush_r,
+                        bcx + blush_r, cheek_y + blush_r],
+                       fill=(255, 165, 130, blush_a))
+        canvas.alpha_composite(bl)
+
+    elif emotion == "curious":
+        pulse     = 0.5 + 0.5 * math.sin(2 * math.pi * 0.4 * t + phase)
+        brow_lift = int(8 * pulse)
+        # One eyebrow raised (which side depends on char_idx for variety)
+        raised_sign = -1 if char_idx % 2 == 0 else 1
+        flat_sign   = -raised_sign
+        # Raised (arched) brow
+        ecx_r = cx + raised_sign * eye_sep
+        draw.arc(
+            [ecx_r - bw, brow_y - brow_lift - bh,
+             ecx_r + bw, brow_y - brow_lift + int(bh * 0.4)],
+            start=200, end=340, fill=(25, 17, 8), width=4,
+        )
+        # Flat brow (minimal arch, stays near normal position)
+        ecx_f = cx + flat_sign * eye_sep
+        draw.arc(
+            [ecx_f - int(bw * 0.9), brow_y - int(bh * 0.3),
+             ecx_f + int(bw * 0.9), brow_y + int(bh * 0.5)],
+            start=215, end=325, fill=(25, 17, 8), width=3,
+        )
+
+    elif emotion == "thoughtful":
+        pulse     = 0.5 + 0.5 * math.sin(2 * math.pi * 0.28 * t + phase)
+        furrow    = int(5 * pulse)
+        # Brows drawn with inner ends angled down — "thinking" look
+        for sign in (-1, 1):
+            ecx      = cx + sign * eye_sep
+            inner_x  = ecx - sign * int(bw * 0.8)   # towards nose
+            outer_x  = ecx + sign * int(bw * 0.8)   # towards temple
+            inner_y  = brow_y + furrow               # inner end dips down
+            outer_y  = brow_y - int(fh * 0.04)       # outer end stays up
+            draw.line(
+                [inner_x, inner_y, outer_x, outer_y],
+                fill=(28, 18, 8), width=3,
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Animation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -337,28 +517,60 @@ def _breathing_scale(t: float, char_idx: int, is_speaking: bool) -> float:
     return 1.0 + depth * math.sin(2 * math.pi * freq * t + phase)
 
 
-def _sway_offset(t: float, char_idx: int, is_speaking: bool) -> tuple[int, int]:
+def _sway_offset(
+    t: float, char_idx: int,
+    is_speaking: bool,
+    emotion: str = "neutral",
+) -> tuple[int, int]:
     """
     Gentle X/Y drift — different frequencies on each axis so it looks organic.
-    Speakers sway a little more (leaning in with emphasis).
+    Emotion amplifies or shapes the sway for the listener.
     """
-    phase  = _CHAR_PHASE[char_idx % 2]
-    amp_x  = 5 if is_speaking else 3
-    amp_y  = 3 if is_speaking else 2
-    # Slightly different freq on each axis for a Lissajous feel
+    phase = _CHAR_PHASE[char_idx % 2]
+
+    if is_speaking:
+        amp_x, amp_y = 5, 3
+    elif emotion == "excited":
+        # Lean in eagerly — bigger forward sway
+        amp_x, amp_y = 6, 4
+    elif emotion == "surprised":
+        # Jitter / flinch — small rapid tremor on X
+        jitter = int(3 * math.sin(2 * math.pi * 3.5 * t + phase))
+        return jitter, int(2 * math.sin(2 * math.pi * 2.8 * t + phase + 0.7))
+    elif emotion == "curious":
+        # Tilt head to one side — asymmetric dx bias
+        tilt = 4                           # constant slight lean
+        dx = tilt + int(2 * math.sin(2 * math.pi * 0.15 * t + phase))
+        dy = int(3 * math.sin(2 * math.pi * 0.10 * t + phase + 1.1))
+        return dx * (1 if char_idx % 2 == 0 else -1), dy
+    elif emotion == "thoughtful":
+        amp_x, amp_y = 2, 2              # slower, more still
+    else:
+        amp_x, amp_y = 3, 2
+
     dx = amp_x * math.sin(2 * math.pi * 0.17 * t + phase)
     dy = amp_y * math.sin(2 * math.pi * 0.11 * t + phase + 1.1)
     return int(dx), int(dy)
 
 
-def _listener_nod(t: float, char_idx: int) -> int:
+def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> int:
     """
-    Slow occasional head-nod for the listener — y-axis only, long period.
-    Returns a pixel offset to add to cy.
+    Slow occasional head-nod for the listener — y-axis only.
+    Amplitude and frequency scale with emotion.
     """
     phase = _CHAR_PHASE[char_idx % 2]
-    # Very slow nod: period ~4 s, amplitude 4 px
-    return int(4 * math.sin(2 * math.pi * 0.25 * t + phase))
+    if emotion == "excited":
+        # Faster, bigger nod — enthusiastic agreement
+        return int(7 * math.sin(2 * math.pi * 0.55 * t + phase))
+    elif emotion == "surprised":
+        # Quick recoil-style jerk
+        return int(6 * abs(math.sin(2 * math.pi * 0.70 * t + phase)))
+    elif emotion == "thoughtful":
+        # Slow, deep single nod
+        return int(5 * math.sin(2 * math.pi * 0.18 * t + phase))
+    else:
+        # Default gentle nod
+        return int(4 * math.sin(2 * math.pi * 0.25 * t + phase))
 
 
 def _animate_face(
@@ -539,14 +751,13 @@ class VideoComposer:
         speaker_idx: int,
         glow: Image.Image,
         subtitle: Image.Image,
+        emotion: str = "neutral",
     ) -> np.ndarray:
         """Compose a single animated RGB frame as numpy array."""
 
         canvas = room_bg.convert("RGBA")
 
         # ── 1. Coffee cups FIRST — faces composited on top ────────────────────
-        # Drawing order: cup → face ensures the face naturally covers the cup
-        # when it's raised to mouth level (looks like drinking).
         for char_idx, is_spk in ((listener_idx, False), (speaker_idx, True)):
             lift        = _sip_lift(t, char_idx, is_spk)
             rx, ry      = self.cup_rest[char_idx]
@@ -559,17 +770,29 @@ class VideoComposer:
 
         # ── 2. Listener — animated portrait (on top of cup) ──────────────────
         lcx, lcy = self.centres[listener_idx]
-        nod_dy   = _listener_nod(t, listener_idx)
+        nod_dy   = _listener_nod(t, listener_idx, emotion=emotion)
         l_face, ldx, ldy = _animate_face(
             listener_face, self.fw, self.fh, t, listener_idx, is_speaking=False
         )
+        # Emotion-driven sway for listener
+        ldx2, ldy2 = _sway_offset(t, listener_idx, is_speaking=False, emotion=emotion)
         _blend_face(canvas, l_face,
-                    lcx + ldx, lcy + ldy + nod_dy,
+                    lcx + ldx2, lcy + ldy2 + nod_dy,
                     l_face.width, l_face.height)
+
+        # ── 2b. Expression overlay on listener ───────────────────────────────
+        _draw_expression(
+            canvas,
+            cx=lcx + ldx2, cy=lcy + ldy2 + nod_dy,
+            fw=self.fw, fh=self.fh,
+            emotion=emotion,
+            t=t,
+            char_idx=listener_idx,
+        )
 
         # ── 3. Speaker glow halo ──────────────────────────────────────────────
         scx, scy = self.centres[speaker_idx]
-        sdx, sdy = _sway_offset(t, speaker_idx, is_speaking=True)
+        sdx, sdy = _sway_offset(t, speaker_idx, is_speaking=True, emotion=emotion)
         gx = scx - self.fw // 2 + sdx
         gy = scy - self.fh // 2 + sdy
         canvas.alpha_composite(glow, (max(0, gx), max(0, gy)))
@@ -646,12 +869,17 @@ class VideoComposer:
         glow          = _speaker_glow(self.fw, self.fh)
         subtitle      = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
+        # Detect the emotional tone of this line so the listener reacts
+        emotion = _detect_emotion(dialogue_text)
+        print(f"  [Composer] Emotion detected: {emotion!r}  ({dialogue_text[:50]}…)")
+
         def make_frame(t: float) -> np.ndarray:
             safe_t    = max(0.0, min(t, wav2lip_dur - 1.0 / max(1, self.fps)))
             spk_frame = talking.get_frame(safe_t)
             return self._build_frame(
                 t, room_bg, listener_face, listener_idx,
                 spk_frame, speaker_idx, glow, subtitle,
+                emotion=emotion,
             )
 
         # ── Write video-only to a temp file ───────────────────────────────────
