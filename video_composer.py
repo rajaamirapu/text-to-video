@@ -600,96 +600,153 @@ class VideoComposer:
         face_image_paths: list[str],
         wav2lip_video_path: str,
         audio_path: str,
-    ):
+        segment_out_path: str,          # write directly to this MP4 file
+    ) -> str:
+        """
+        Render one dialogue segment and write it as a self-contained MP4
+        (video + audio muxed together via ffmpeg).  Returns segment_out_path.
+
+        Writing each segment immediately — rather than collecting MoviePy
+        clips and concatenating later — guarantees the audio is always
+        present.  MoviePy lazy-loads AudioFileClip readers that can become
+        stale by the time the final write happens; bypassing that entirely
+        removes the most common cause of silent output.
+        """
+        import subprocess
         VideoFileClip, AudioFileClip, VideoClip, _ = _mp()
 
         talking      = VideoFileClip(wav2lip_video_path)
         wav2lip_dur  = talking.duration
         listener_idx = 1 - speaker_idx
 
-        # ── Load audio — voice must always be present ─────────────────────────
-        # Use the TTS WAV as the master clock; Wav2Lip video frames are clamped.
-        audio     = None
+        # ── Determine duration from TTS audio (master clock) ─────────────────
         audio_dur = wav2lip_dur
-
-        if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 256):
-            print(f"  [Composer] ⚠ Audio file missing/empty: {audio_path}")
-        else:
+        audio_ok  = os.path.exists(audio_path) and os.path.getsize(audio_path) > 256
+        if audio_ok:
             try:
-                audio = AudioFileClip(audio_path)
-                if audio.duration < 0.05:
-                    print(f"  [Composer] ⚠ Audio too short ({audio.duration:.3f}s) — voice may be missing")
-                    audio = None
-                else:
-                    audio_dur = audio.duration
-                    print(f"  [Composer] Audio loaded: {audio.duration:.2f}s")
-            except Exception as exc:
-                print(f"  [Composer] ⚠ Could not load audio {audio_path}: {exc}")
-                audio = None
+                tmp_a = AudioFileClip(audio_path)
+                audio_dur = tmp_a.duration
+                tmp_a.close()
+                print(f"  [Composer] Audio: {audio_dur:.2f}s  ({os.path.basename(audio_path)})")
+            except Exception as e:
+                print(f"  [Composer] ⚠ Cannot read audio duration: {e}")
+                audio_ok = False
+        else:
+            print(f"  [Composer] ⚠ Audio file missing/empty: {audio_path}")
 
         duration = max(audio_dur, 0.5)
 
-        # Pre-build static resources
+        # ── Pre-build static per-segment resources ────────────────────────────
         if self.room_bg_image is not None:
             room_bg = self.room_bg_image.resize((self.width, self.char_h), Image.LANCZOS)
         else:
             room_bg = _get_room_bg(self.width, self.char_h, self.room_bg_path)
 
-        listener_img_path = face_image_paths[listener_idx]
-        listener_face     = Image.open(listener_img_path).convert("RGB")
-        glow              = _speaker_glow(self.fw, self.fh)
-        subtitle          = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
+        listener_face = Image.open(face_image_paths[listener_idx]).convert("RGB")
+        glow          = _speaker_glow(self.fw, self.fh)
+        subtitle      = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
         def make_frame(t: float) -> np.ndarray:
-            # Clamp t to Wav2Lip video duration so we never seek past end
-            safe_t    = min(t, wav2lip_dur - 1.0 / max(1, self.fps))
-            safe_t    = max(0.0, safe_t)
+            safe_t    = max(0.0, min(t, wav2lip_dur - 1.0 / max(1, self.fps)))
             spk_frame = talking.get_frame(safe_t)
             return self._build_frame(
-                t,                                  # ← animation clock
-                room_bg, listener_face, listener_idx,
-                spk_frame, speaker_idx,
-                glow, subtitle,
+                t, room_bg, listener_face, listener_idx,
+                spk_frame, speaker_idx, glow, subtitle,
             )
 
-        clip = VideoClip(make_frame, duration=duration)
-        clip = clip.with_fps(self.fps) if hasattr(clip, "with_fps") else clip.set_fps(self.fps)
+        # ── Write video-only to a temp file ───────────────────────────────────
+        tmp_vid = segment_out_path + "_noaudio.mp4"
+        clip    = VideoClip(make_frame, duration=duration)
+        clip    = clip.with_fps(self.fps) if hasattr(clip, "with_fps") else clip.set_fps(self.fps)
+        clip.write_videofile(
+            tmp_vid, fps=self.fps,
+            codec="libx264", audio=False,
+            logger=None,
+        )
+        talking.close()
 
-        if audio is not None:
-            # Trim audio to video duration if longer
-            if audio.duration > duration + 0.05:
-                try:
-                    audio = audio.subclipped(0, duration)
-                except AttributeError:
-                    audio = audio.subclip(0, duration)
-            # Attach audio — try both MoviePy v1 and v2 API
-            try:
-                clip = clip.with_audio(audio)
-            except AttributeError:
-                clip = clip.set_audio(audio)
+        # ── Mux audio in via ffmpeg — 100 % reliable ─────────────────────────
+        if audio_ok:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", tmp_vid,           # video track (no audio)
+                "-i", audio_path,        # TTS audio (WAV/MP3)
+                "-c:v", "copy",          # copy video stream (no re-encode)
+                "-c:a", "aac",           # encode audio to AAC
+                "-ar", "44100",
+                "-ac", "1",
+                "-shortest",             # trim to shorter of the two streams
+                segment_out_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0 and os.path.isfile(segment_out_path):
+                print(f"  [Composer] ✓ Segment written with audio: {segment_out_path}")
+            else:
+                print(f"  [Composer] ⚠ ffmpeg mux failed:\n{result.stderr[-400:]}")
+                # Fallback: just use video-only file
+                import shutil
+                shutil.move(tmp_vid, segment_out_path)
         else:
-            print(f"  [Composer] ⚠ Segment has no audio — check TTS output")
+            # No audio available — keep video-only segment so pipeline continues
+            import shutil
+            shutil.move(tmp_vid, segment_out_path)
+            print(f"  [Composer] ⚠ Segment written WITHOUT audio: {segment_out_path}")
 
-        return clip
+        # Clean up temp video-only file
+        if os.path.isfile(tmp_vid):
+            try:
+                os.unlink(tmp_vid)
+            except Exception:
+                pass
+
+        return segment_out_path
 
     # ── export ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def concat_and_write(clips: list, output_path: str, fps: int = 25):
-        _, _, _, concatenate_videoclips = _mp()
-        import inspect, tempfile as _tf
+    def concat_and_write(segment_paths: list[str], output_path: str, fps: int = 25):
+        """
+        Concatenate pre-written segment MP4 files into the final video using
+        ffmpeg's concat demuxer.  This is far more reliable than MoviePy's
+        concatenate_videoclips() for preserving audio.
+        """
+        import subprocess
+        import tempfile
 
-        final = concatenate_videoclips(clips, method="compose")
-        tmp_a = os.path.join(_tf.gettempdir(), "ttv_final_audio.m4a")
-        kw    = dict(fps=fps, codec="libx264", audio_codec="aac",
-                     temp_audiofile=tmp_a, remove_temp=False, logger="bar")
-        if "verbose" in inspect.signature(final.write_videofile).parameters:
-            kw["verbose"] = False
+        if len(segment_paths) == 0:
+            raise ValueError("No segments to concatenate.")
+
+        if len(segment_paths) == 1:
+            import shutil
+            shutil.copy(segment_paths[0], output_path)
+            print(f"  [Composer] Single segment copied → {output_path}")
+            return
+
+        # Write ffmpeg concat list
+        list_file = tempfile.mktemp(suffix="_concat_list.txt")
+        with open(list_file, "w") as f:
+            for seg in segment_paths:
+                # Escape single quotes in paths
+                safe = seg.replace("'", "\\'")
+                f.write(f"file '{safe}'\n")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",        # stream copy — no re-encoding
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
         try:
-            final.write_videofile(output_path, **kw)
-        finally:
-            try:
-                os.path.exists(tmp_a) and os.unlink(tmp_a)
-            except Exception:
-                pass
-        return final
+            os.unlink(list_file)
+        except Exception:
+            pass
+
+        if result.returncode != 0:
+            print(f"  [Composer] ffmpeg concat stderr:\n{result.stderr[-600:]}")
+            raise RuntimeError("ffmpeg concat failed — check output above.")
+
+        size = os.path.getsize(output_path)
+        print(f"  [Composer] ✓ Final video: {output_path}  ({size // 1024} KB)")

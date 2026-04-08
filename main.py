@@ -237,13 +237,13 @@ def main():
     from video_composer  import VideoComposer
     from lip_sync        import get_audio_duration
 
-    composer   = VideoComposer(
+    composer       = VideoComposer(
         args.width, args.height, args.fps,
         room_bg_image   = room_img,
         char_body_paths = char_body_paths,
     )
-    clips      = []
-    tmp_dir    = tempfile.mkdtemp(prefix="ttv_")
+    segment_paths  = []
+    tmp_dir        = tempfile.mkdtemp(prefix="ttv_")
 
     try:
         for line_idx, line in enumerate(dialogue):
@@ -275,20 +275,22 @@ def main():
                 pad_bottom      = 12,
             )
 
-            # ── compose segment ───────────────────────────────────────────────
-            clip = composer.create_segment(
-                speaker_idx       = speaker_idx,
-                dialogue_text     = text,
-                speaker_name      = speaker,
-                face_image_paths  = ordered_faces,
-                wav2lip_video_path= wav2lip_out,
-                audio_path        = audio_path,
+            # ── compose segment (writes MP4 with muxed audio immediately) ─────
+            seg_out = os.path.join(tmp_dir, f"line_{line_idx:03d}_segment.mp4")
+            composer.create_segment(
+                speaker_idx        = speaker_idx,
+                dialogue_text      = text,
+                speaker_name       = speaker,
+                face_image_paths   = ordered_faces,
+                wav2lip_video_path = wav2lip_out,
+                audio_path         = audio_path,
+                segment_out_path   = seg_out,
             )
-            clips.append(clip)
+            segment_paths.append(seg_out)
 
         # ── 7. Concatenate & export ───────────────────────────────────────────
         banner(f"Exporting final video → {args.output}")
-        VideoComposer.concat_and_write(clips, args.output, fps=args.fps)
+        VideoComposer.concat_and_write(segment_paths, args.output, fps=args.fps)
 
     finally:
         import shutil
