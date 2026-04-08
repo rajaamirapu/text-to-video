@@ -35,12 +35,19 @@ import wave
 # 1. edge-tts  (Microsoft neural TTS)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Male neural voices to try, in preference order
+# Neural voices to try, in preference order — by gender
 EDGE_MALE_VOICES = [
     "en-US-GuyNeural",           # confident American broadcaster
     "en-US-ChristopherNeural",   # authoritative American
     "en-GB-RyanNeural",          # British male
     "en-AU-WilliamNeural",       # Australian male
+]
+
+EDGE_FEMALE_VOICES = [
+    "en-US-JennyNeural",         # warm American female
+    "en-US-AriaNeural",          # expressive American female
+    "en-GB-SoniaNeural",         # British female
+    "en-AU-NatashaNeural",       # Australian female
 ]
 
 
@@ -56,9 +63,10 @@ async def _edge_tts_async(text: str, path: str, voice: str) -> bool:
         return False
 
 
-def _edge_tts(text: str, wav_path: str) -> bool:
+def _edge_tts(text: str, wav_path: str, voice_list: list) -> bool:
     """
-    Try each Microsoft neural voice in turn.  Returns True if any succeeds.
+    Try each Microsoft neural voice in *voice_list* in turn.
+    Returns True if any succeeds.
     Saves to *wav_path* (edge-tts saves as MP3; we convert to WAV via ffmpeg).
     """
     try:
@@ -69,7 +77,7 @@ def _edge_tts(text: str, wav_path: str) -> bool:
 
     tmp_mp3 = wav_path.replace(".wav", "_edge_raw.mp3")
 
-    for voice in EDGE_MALE_VOICES:
+    for voice in voice_list:
         try:
             ok = asyncio.run(_edge_tts_async(text, tmp_mp3, voice))
         except RuntimeError:
@@ -177,14 +185,17 @@ def text_to_speech(
     lang: str = "en",
     deep_voice: bool = True,        # kept for API compat; unused
     pitch_rate: float = 0.92,       # kept for API compat; unused
+    speaker_gender: str = "male",   # "female" → female neural voices
 ) -> str:
     """
-    Convert *text* to a natural male WAV audio file.
+    Convert *text* to a natural WAV audio file.
 
     Always returns a path to a WAV file.
 
     Engine priority:
       1. edge-tts  (Microsoft neural voices  — best quality, needs internet)
+         Uses EDGE_FEMALE_VOICES when speaker_gender="female",
+         EDGE_MALE_VOICES otherwise.
       2. pyttsx3   (system voices — offline, quality varies)
       3. Silent WAV (so the pipeline never crashes)
     """
@@ -195,8 +206,15 @@ def text_to_speech(
     base    = os.path.splitext(output_path)[0]
     wav_out = base + ".wav"
 
+    # Pick voice list based on gender
+    voice_list = (
+        EDGE_FEMALE_VOICES
+        if speaker_gender.strip().lower() in ("female", "f", "woman", "girl")
+        else EDGE_MALE_VOICES
+    )
+
     # 1. edge-tts  (Microsoft neural — best quality)
-    if _edge_tts(text, wav_out):
+    if _edge_tts(text, wav_out, voice_list):
         return wav_out
 
     # 2. pyttsx3 (offline)

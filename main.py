@@ -258,9 +258,15 @@ def main():
             )
 
             # ── TTS ───────────────────────────────────────────────────────────
-            # text_to_speech always returns a WAV file (pitch-shifted PCM)
+            # text_to_speech always returns a WAV file
+            speaker_gender = char_data.get(speaker, {}).get("gender", "male")
             audio_path = os.path.join(tmp_dir, f"line_{line_idx:03d}_audio.wav")
-            audio_path = text_to_speech(text, output_path=audio_path, lang=args.lang)
+            audio_path = text_to_speech(
+                text,
+                output_path    = audio_path,
+                lang           = args.lang,
+                speaker_gender = speaker_gender,
+            )
 
             duration = get_audio_duration(audio_path) + args.pause
 
@@ -349,9 +355,15 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
         text     = line["text"]
         spk_idx  = char_names.index(speaker) if speaker in char_names else 0
 
-        audio_path = tempfile.mktemp(suffix=".mp3")
+        audio_path     = tempfile.mktemp(suffix=".wav")
         tmp_files.append(audio_path)
-        audio_path  = text_to_speech(text, output_path=audio_path, lang=args.lang)
+        spk_gender     = char_data.get(speaker, {}).get("gender", "male")
+        audio_path     = text_to_speech(
+            text,
+            output_path    = audio_path,
+            lang           = args.lang,
+            speaker_gender = spk_gender,
+        )
         mouth_vals  = list(extract_mouth_openings(audio_path, fps)) + [0.0] * int(fps * 0.3)
         n_frames    = len(mouth_vals)
         duration    = n_frames / fps
