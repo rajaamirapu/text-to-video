@@ -110,8 +110,8 @@ def step_install_wav2lip_deps():
     # ── Additional pipeline packages ──────────────────────────────────────────
     pip_install(
         "gdown",      # Google Drive downloader
-        "gtts",
-        "pyttsx3",
+        "edge-tts",   # Microsoft neural TTS (primary voice engine)
+        "pyttsx3",    # offline TTS fallback
         "moviepy",
         "Pillow",
         "requests",

@@ -5,18 +5,17 @@ Engine priority
 ---------------
 1. edge-tts   (Microsoft neural TTS — sounds like a real person, free)
                Voices tried in order:
-                 en-US-GuyNeural, en-US-ChristopherNeural, en-GB-RyanNeural
-2. gTTS        (Google TTS fallback — decent quality, needs internet)
-               Slight pitch-down to 44.1 kHz WAV via ffmpeg (no atempo)
-3. pyttsx3     (offline fallback — system voices, variable quality)
-4. Silent WAV  (last resort so the pipeline never crashes)
+                 en-US-GuyNeural, en-US-ChristopherNeural, en-GB-RyanNeural,
+                 en-AU-WilliamNeural
+2. pyttsx3     (offline fallback — system voices, variable quality)
+3. Silent WAV  (last resort so the pipeline never crashes)
 
 Why edge-tts?
 -------------
-gTTS is a robot.  No amount of pitch-shifting fixes its monotone cadence.
-Microsoft's neural voices (edge-tts) are trained on real human speech and
-sound natural out of the box — no pitch manipulation needed, no speed
-artefacts.
+Microsoft's neural voices are trained on real human speech and sound natural
+out of the box — no pitch manipulation needed, no speed artefacts.
+gTTS has been removed completely: it sounds robotic regardless of pitch
+processing, and it requires internet access just like edge-tts anyway.
 
 Install
 -------
@@ -92,67 +91,7 @@ def _edge_tts(text: str, wav_path: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. gTTS + optional mild pitch-down  (fallback)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _gtts_wav(text: str, wav_path: str, lang: str = "en",
-              pitch_rate: float = 0.92) -> bool:
-    """
-    gTTS → raw MP3 → optional pitch-down → WAV.
-
-    pitch_rate=0.92 ≈ 1.5 semitones lower (just enough to sound male without
-    introducing speed artefacts).  Uses asetrate+aresample only — NO atempo.
-    """
-    try:
-        from gtts import gTTS
-    except ImportError:
-        return False
-
-    tmp_raw = wav_path.replace(".wav", "_gtts_raw.mp3")
-    try:
-        tts = gTTS(text=text, lang=lang, slow=True)
-        tts.save(tmp_raw)
-        if not (os.path.isfile(tmp_raw) and os.path.getsize(tmp_raw) > 0):
-            return False
-        print(f"  [TTS] gTTS raw ✓")
-    except Exception as e:
-        print(f"  [TTS] gTTS failed: {e}")
-        _cleanup(tmp_raw)
-        return False
-
-    # Pitch-down via asetrate+aresample, output straight to WAV
-    # (WAV has no sample-rate restrictions, unlike MP3)
-    af = f"asetrate=44100*{pitch_rate:.6f},aresample=44100"
-    cmd = [
-        "ffmpeg", "-y", "-i", tmp_raw,
-        "-af", af,
-        "-ar", "44100", "-ac", "1",
-        "-c:a", "pcm_s16le",
-        wav_path,
-    ]
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=60)
-        _cleanup(tmp_raw)
-        if r.returncode == 0 and os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0:
-            print(f"  [TTS] gTTS + pitch-down ✓  rate={pitch_rate}")
-            return True
-        # ffmpeg failed — try plain conversion without pitch shift
-        print("  [TTS] pitch-down failed, converting gTTS directly to WAV …")
-        from gtts import gTTS as _gTTS
-        tts2 = _gTTS(text=text, lang=lang, slow=True)
-        tmp2 = wav_path.replace(".wav", "_gtts2_raw.mp3")
-        tts2.save(tmp2)
-        ok = _to_wav(tmp2, wav_path)
-        _cleanup(tmp2)
-        return ok
-    except Exception as e:
-        print(f"  [TTS] gTTS WAV conversion failed: {e}")
-        _cleanup(tmp_raw)
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. pyttsx3  (offline fallback)
+# 2. pyttsx3  (offline fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pyttsx3_wav(text: str, wav_path: str) -> bool:
@@ -183,7 +122,7 @@ def _pyttsx3_wav(text: str, wav_path: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Silent WAV  (last resort)
+# 3. Silent WAV  (last resort)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _silent_wav(duration_s: float, path: str) -> bool:
@@ -236,8 +175,8 @@ def text_to_speech(
     text: str,
     output_path: str | None = None,
     lang: str = "en",
-    deep_voice: bool = True,        # kept for API compat; edge-tts ignores it
-    pitch_rate: float = 0.92,       # only used by gTTS fallback
+    deep_voice: bool = True,        # kept for API compat; unused
+    pitch_rate: float = 0.92,       # kept for API compat; unused
 ) -> str:
     """
     Convert *text* to a natural male WAV audio file.
@@ -246,9 +185,8 @@ def text_to_speech(
 
     Engine priority:
       1. edge-tts  (Microsoft neural voices  — best quality, needs internet)
-      2. gTTS      (Google TTS + mild pitch-down — decent, needs internet)
-      3. pyttsx3   (system voices — offline, quality varies)
-      4. Silent WAV (so the pipeline never crashes)
+      2. pyttsx3   (system voices — offline, quality varies)
+      3. Silent WAV (so the pipeline never crashes)
     """
     if output_path is None:
         output_path = tempfile.mktemp(suffix=".wav")
@@ -261,17 +199,12 @@ def text_to_speech(
     if _edge_tts(text, wav_out):
         return wav_out
 
-    # 2. gTTS + pitch-down
-    print("  [TTS] edge-tts unavailable, trying gTTS …")
-    if _gtts_wav(text, wav_out, lang=lang, pitch_rate=pitch_rate):
-        return wav_out
-
-    # 3. pyttsx3
-    print("  [TTS] gTTS unavailable, trying pyttsx3 …")
+    # 2. pyttsx3 (offline)
+    print("  [TTS] edge-tts unavailable, trying pyttsx3 …")
     if _pyttsx3_wav(text, wav_out):
         return wav_out
 
-    # 4. silent — pipeline won't crash but voice will be missing
+    # 3. silent — pipeline won't crash but voice will be missing
     print(f"  [TTS] ⚠ ALL engines failed — producing silent audio for: \"{text[:50]}\"")
     duration = max(1.5, len(text.split()) / 120 * 60)
     _silent_wav(duration, wav_out)

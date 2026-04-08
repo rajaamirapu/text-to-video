@@ -9,7 +9,7 @@ Full pipeline
   2. Stable Diffusion  →  portrait per character (face_<name>.png)
   3. Stable Diffusion  →  photorealistic room background
   4. For each dialogue line:
-       a. gTTS  →  TTS audio (.mp3)  [deep male voice via ffmpeg pitch-shift]
+       a. edge-tts (Microsoft neural)  →  TTS audio (.wav)
        b. Wav2Lip (GPU)  →  lip-synced talking face video for the speaker
        c. Static face video  →  the listener (mouth closed)
   5. Compose side-by-side + subtitle bar  →  final MP4
