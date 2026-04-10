@@ -102,15 +102,26 @@ ROOM_NEGATIVE = (
 )
 
 
-def portrait_prompt(name: str, role: str, gender: str) -> str:
+def portrait_prompt(name: str, role: str, gender: str, panel_idx: int = 0) -> str:
+    """
+    Build a portrait prompt.
+
+    panel_idx : 0 = left panel  → character should face RIGHT (toward partner)
+                1 = right panel → character should face LEFT  (toward partner)
+    """
     gender_word = "man" if gender == "male" else "woman"
-    facing      = "slightly right" if gender == "female" else "slightly left"
+    # Direction is driven by panel position so they always face each other,
+    # regardless of gender.
+    if panel_idx == 0:
+        facing = "slightly right, looking toward the right side of frame"
+    else:
+        facing = "slightly left, looking toward the left side of frame"
     return (
         f"photorealistic portrait headshot of a {gender_word}, {role}, "
-        f"facing {facing}, natural friendly expression, "
+        f"facing {facing}, natural conversational expression, "
         f"professional business casual attire, "
         f"soft studio lighting, shallow depth of field, sharp focus on face, "
-        f"plain light grey background, 4K DSLR quality, ultra realistic skin texture"
+        f"plain neutral dark background, 4K DSLR quality, ultra realistic skin texture"
     )
 
 
@@ -174,7 +185,8 @@ def main():
             print(f"[Room BG] ✓ Saved → {room_path}  ({img.size[0]}×{img.size[1]})\n")
 
     # ── Generate character faces ───────────────────────────────────────────────
-    for name, info in characters.items():
+    char_list = list(characters.items())
+    for panel_idx, (name, info) in enumerate(char_list):
         role   = info.get("role",   "person")
         gender = info.get("gender", "neutral")
         safe   = name.lower().replace(" ", "_")
@@ -185,8 +197,8 @@ def main():
             print(f"         (use --regen to regenerate)")
             continue
 
-        print(f"[{name}] Generating {gender} {role} portrait …")
-        prompt = portrait_prompt(name, role, gender)
+        print(f"[{name}] Generating {gender} {role} portrait (panel {panel_idx}) …")
+        prompt = portrait_prompt(name, role, gender, panel_idx=panel_idx)
         print(f"  → Prompt: {prompt[:90]}…")
 
         img = generate_image(

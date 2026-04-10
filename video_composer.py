@@ -952,17 +952,17 @@ class VideoComposer:
         canvas.paste(self._panel_bgs[1].convert("RGBA"), (self.panel_w, 0))
 
         # ── Per-character face rendering ──────────────────────────────────────
-        # Faces are mirrored so they look TOWARD each other across the divider:
-        #   char 0 (left panel)  → flip horizontally → faces RIGHT (toward char 1)
-        #   char 1 (right panel) → keep as-is        → faces LEFT  (toward char 0)
-        # This makes the conversation look natural without any sofa/room tricks.
+        # No horizontal flipping is done here.  The portrait prompts in
+        # generate_faces.py / main.py bake the correct inward-facing direction
+        # directly into the SD-generated image:
+        #   char 0 (left panel)  → prompted "facing slightly right"
+        #   char 1 (right panel) → prompted "facing slightly left"
+        # Flipping in the compositor would fight that and reverse the effect.
 
         for char_idx in (listener_idx, speaker_idx):
             is_spk   = (char_idx == speaker_idx)
             cx, cy   = self.centres[char_idx]
             px0      = self.panel_x[char_idx]
-            # Left-panel character faces right; right-panel faces left (default)
-            mirror   = (char_idx % 2 == 0)
 
             if is_spk:
                 # Speaker: Wav2Lip animated frame
@@ -971,8 +971,6 @@ class VideoComposer:
                 sw = max(1, int(self.fw * scale))
                 sh = max(1, int(self.fh * scale))
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
-                if mirror:
-                    face_img = face_img.transpose(Image.FLIP_LEFT_RIGHT)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
                 # Listener: static portrait with breathing + emotion animation
@@ -981,8 +979,6 @@ class VideoComposer:
                     listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
                 )
                 ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
-                if mirror:
-                    l_face = l_face.transpose(Image.FLIP_LEFT_RIGHT)
                 _blend_panel_face(canvas, l_face, px0,
                                   cy + ldy2 + nod_dy,
                                   l_face.width, l_face.height)

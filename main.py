@@ -96,14 +96,18 @@ def _generate_missing_faces(
         role   = info.get("role",   "person")
         gender = info.get("gender", "neutral")
 
-        gw    = "man" if gender == "male" else "woman"
-        facing = "slightly right" if gender == "female" else "slightly left"
+        gw = "man" if gender == "male" else "woman"
+        # char index 0 = left panel  → faces right (toward the other person)
+        # char index 1 = right panel → faces left  (toward the other person)
+        char_idx_local = char_names.index(name)
+        facing = "slightly right, looking toward the right" if char_idx_local == 0 \
+                 else "slightly left, looking toward the left"
         prompt = (
             f"photorealistic portrait headshot of a {gw}, {role}, "
-            f"facing {facing}, natural friendly expression, "
+            f"facing {facing}, natural conversational expression, "
             f"professional business casual attire, "
             f"soft studio lighting, shallow depth of field, sharp focus on face, "
-            f"plain light grey background, 4K DSLR quality, ultra realistic skin texture"
+            f"plain neutral dark background, 4K DSLR quality, ultra realistic skin texture"
         )
 
         print(f"  [SD] Generating face for '{name}' ({gender} {role}) …")
