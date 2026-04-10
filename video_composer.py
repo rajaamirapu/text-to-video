@@ -909,20 +909,6 @@ class VideoComposer:
         cy   = int(self.char_h * 0.46)   # head sits in upper portion
         self.centres = [(cx_l, cy), (cx_r, cy)]
 
-        # Coffee cup — appears near bottom of each panel (desk level)
-        cup_off_x   = int(self.fw * 0.24)
-        cup_rest_y  = int(self.char_h * 0.80)
-        cup_mouth_y = cy + int(self.fh * 0.10)
-        self.cup_rest = [
-            (cx_l + cup_off_x, cup_rest_y),
-            (cx_r - cup_off_x, cup_rest_y),
-        ]
-        self.cup_mouth = [
-            (cx_l + int(cup_off_x * 0.35), cup_mouth_y),
-            (cx_r - int(cup_off_x * 0.35), cup_mouth_y),
-        ]
-        self.cup_size = max(28, int(self.panel_w * 0.09))
-
         # Pre-render studio panel backgrounds (expensive; done once)
         self._panel_bgs = [
             _make_panel_bg(self.panel_w, self.char_h, 0),
@@ -966,26 +952,37 @@ class VideoComposer:
         canvas.paste(self._panel_bgs[1].convert("RGBA"), (self.panel_w, 0))
 
         # ── Per-character face rendering ──────────────────────────────────────
+        # Faces are mirrored so they look TOWARD each other across the divider:
+        #   char 0 (left panel)  → flip horizontally → faces RIGHT (toward char 1)
+        #   char 1 (right panel) → keep as-is        → faces LEFT  (toward char 0)
+        # This makes the conversation look natural without any sofa/room tricks.
+
         for char_idx in (listener_idx, speaker_idx):
             is_spk   = (char_idx == speaker_idx)
             cx, cy   = self.centres[char_idx]
             px0      = self.panel_x[char_idx]
+            # Left-panel character faces right; right-panel faces left (default)
+            mirror   = (char_idx % 2 == 0)
 
             if is_spk:
-                # Speaker: use Wav2Lip animated frame
-                scale   = _breathing_scale(t, char_idx, is_speaking=True)
+                # Speaker: Wav2Lip animated frame
+                scale    = _breathing_scale(t, char_idx, is_speaking=True)
                 sdx, sdy = _sway_offset(t, char_idx, is_speaking=True, emotion=emotion)
                 sw = max(1, int(self.fw * scale))
                 sh = max(1, int(self.fh * scale))
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
+                if mirror:
+                    face_img = face_img.transpose(Image.FLIP_LEFT_RIGHT)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
                 # Listener: static portrait with breathing + emotion animation
-                nod_dy      = _listener_nod(t, char_idx, emotion=emotion)
+                nod_dy           = _listener_nod(t, char_idx, emotion=emotion)
                 l_face, ldx, ldy = _animate_face(
                     listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
                 )
                 ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
+                if mirror:
+                    l_face = l_face.transpose(Image.FLIP_LEFT_RIGHT)
                 _blend_panel_face(canvas, l_face, px0,
                                   cy + ldy2 + nod_dy,
                                   l_face.width, l_face.height)
@@ -996,23 +993,6 @@ class VideoComposer:
                     fw=self.fw, fh=self.fh,
                     emotion=emotion, t=t, char_idx=char_idx,
                 )
-
-        # ── Coffee cups (drawn after faces so hand/cup is in front) ──────────
-        for char_idx, is_spk in ((listener_idx, False), (speaker_idx, True)):
-            lift   = _sip_lift(t, char_idx, is_spk)
-            rx, ry = self.cup_rest[char_idx]
-            mx, my = self.cup_mouth[char_idx]
-            _draw_coffee_cup(
-                canvas,
-                int(rx + lift * (mx - rx)),
-                int(ry + lift * (my - ry)),
-                size=self.cup_size, t=t,
-                char_idx=char_idx, lift=lift,
-            )
-
-        # ── Speaker panel border ──────────────────────────────────────────────
-        _draw_speaker_border(canvas, self.panel_x[speaker_idx],
-                             self.panel_w, self.char_h, t, speaker_idx)
 
         # ── Name tags ─────────────────────────────────────────────────────────
         for char_idx in (listener_idx, speaker_idx):
