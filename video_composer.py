@@ -690,6 +690,183 @@ def _draw_coffee_cup(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Split-screen studio helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_panel_bg(panel_w: int, panel_h: int, char_idx: int) -> Image.Image:
+    """
+    Studio-quality gradient background for one character panel.
+    Each character gets a distinct warm/cool neutral tone so the panels
+    are visually separate without being jarring.
+    """
+    # Char 0 → cool blue-slate studio  |  Char 1 → warm charcoal studio
+    if char_idx % 2 == 0:
+        dark  = np.array([22,  28,  42], dtype=np.float32)   # deep blue-slate
+        mid   = np.array([48,  58,  82], dtype=np.float32)   # lighter centre
+        rim   = np.array([80, 100, 140], dtype=np.float32)   # subtle rim-light
+    else:
+        dark  = np.array([30,  22,  18], dtype=np.float32)   # warm charcoal
+        mid   = np.array([68,  52,  44], dtype=np.float32)
+        rim   = np.array([120, 90,  70], dtype=np.float32)
+
+    xs = np.linspace(-1.0,  1.0, panel_w, dtype=np.float32)[None, :]   # (1, W)
+    ys = np.linspace( 0.0,  1.0, panel_h, dtype=np.float32)[:, None]   # (H, 1)
+
+    # Radial weight centred at upper-middle (face will live here)
+    radial = np.sqrt(xs ** 2 + (ys - 0.35) ** 2)          # (H, W)
+    t_c    = np.clip(radial / 1.1, 0.0, 1.0)[:, :, None]  # centre falloff
+    # Subtle vertical rim-light strip on the outer edge of each panel
+    if char_idx % 2 == 0:
+        rim_x = np.clip((xs + 1.0) / 0.18, 0.0, 1.0)     # left edge
+    else:
+        rim_x = np.clip((1.0 - xs) / 0.18, 0.0, 1.0)     # right edge
+    rim_w  = rim_x[:, :, None] * 0.35
+
+    colour = (mid[None, None, :] * (1 - t_c) +
+              dark[None, None, :] * t_c +
+              rim[None, None, :]  * rim_w)
+    colour = np.clip(colour, 0, 255).astype(np.uint8)
+    return Image.fromarray(colour, mode="RGB")
+
+
+def _blend_panel_face(
+    canvas: Image.Image,
+    face_img: Image.Image,
+    panel_x0: int,
+    cy: int,
+    fw: int,
+    fh: int,
+) -> None:
+    """
+    Composite a portrait into its panel.
+
+    Unlike the old oval-mask approach, the portrait fills the full panel width
+    so the character looks like a real person in frame.  Only the top and
+    bottom edges are feathered (natural vignette) — the left/right panel
+    boundaries act as the natural crop.
+    """
+    face = face_img.convert("RGBA").resize((fw, fh), Image.LANCZOS)
+
+    # Vertical alpha ramp: fade top 8 % and bottom 14 % of portrait
+    arr   = np.array(face, dtype=np.uint8)
+    alpha = arr[:, :, 3].astype(np.float32)
+
+    fade_top = max(1, int(fh * 0.08))
+    fade_bot = max(1, int(fh * 0.14))
+    for i in range(fade_top):
+        alpha[i, :] *= i / fade_top
+    for i in range(fade_bot):
+        alpha[fh - 1 - i, :] *= i / fade_bot
+
+    arr[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+    face = Image.fromarray(arr)
+
+    # Paste position (clip to canvas bounds)
+    px = panel_x0 + (fw == canvas.width // 2 and 0 or (canvas.width // 2 - fw) // 2)
+    # Centre the portrait horizontally within the panel
+    px = panel_x0 + max(0, (canvas.width // 2 - fw) // 2)
+    py = cy - fh // 2
+
+    # Clamp so we never go outside the canvas
+    px = max(0, min(px, canvas.width  - 1))
+    py = max(0, min(py, canvas.height - 1))
+    canvas.alpha_composite(face, (px, py))
+
+
+def _draw_speaker_border(
+    canvas: Image.Image,
+    panel_x0: int,
+    panel_w: int,
+    char_h: int,
+    t: float,
+    char_idx: int,
+) -> None:
+    """
+    Pulsing coloured border around the active speaker's panel.
+    Colour is unique per character so the audience always knows who is talking.
+    """
+    colours = [
+        (80, 160, 255),   # char 0 → cool blue
+        (255, 140,  80),  # char 1 → warm orange
+    ]
+    base_col = colours[char_idx % len(colours)]
+    pulse    = 0.65 + 0.35 * math.sin(2 * math.pi * 1.2 * t + _CHAR_PHASE[char_idx % 2])
+    alpha    = int(200 * pulse)
+
+    border_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    bd = ImageDraw.Draw(border_layer)
+    bw = 5   # border thickness
+    bd.rectangle(
+        [panel_x0 + bw, bw, panel_x0 + panel_w - bw, char_h - bw],
+        outline=(*base_col, alpha),
+        width=bw,
+    )
+    canvas.alpha_composite(border_layer)
+
+
+def _draw_name_tag(
+    canvas: Image.Image,
+    panel_x0: int,
+    panel_w: int,
+    char_h: int,
+    name: str,
+    is_speaker: bool,
+    char_idx: int,
+) -> None:
+    """
+    Floating name tag at the bottom of each character's panel.
+    Active speaker's tag is brighter / coloured; listener is muted.
+    """
+    tag_h = max(28, int(char_h * 0.07))
+    tag_w = min(panel_w - 40, max(120, int(panel_w * 0.55)))
+    tag_x = panel_x0 + (panel_w - tag_w) // 2
+    tag_y = char_h - tag_h - int(char_h * 0.04)
+
+    tag = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    td  = ImageDraw.Draw(tag)
+
+    if is_speaker:
+        bg_col  = (20, 20, 20, 200)
+        border  = [(80, 160, 255, 230), (255, 140, 80, 230)][char_idx % 2]
+        txt_col = (255, 255, 255, 255)
+    else:
+        bg_col  = (15, 15, 15, 140)
+        border  = (80, 80, 80, 160)
+        txt_col = (180, 180, 180, 200)
+
+    td.rounded_rectangle(
+        [tag_x, tag_y, tag_x + tag_w, tag_y + tag_h],
+        radius=6, fill=bg_col, outline=border, width=2,
+    )
+
+    # Name text — attempt to use a font, fall back to default
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                                  max(12, tag_h - 10))
+    except Exception:
+        font = None
+
+    td.text(
+        (tag_x + tag_w // 2, tag_y + tag_h // 2),
+        name.upper(),
+        fill=txt_col,
+        font=font,
+        anchor="mm" if font else None,
+    )
+    canvas.alpha_composite(tag)
+
+
+def _draw_divider(canvas: Image.Image, char_h: int) -> None:
+    """Thin vertical divider line between the two panels."""
+    mid_x  = canvas.width // 2
+    div    = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    dd     = ImageDraw.Draw(div)
+    dd.line([(mid_x, 0), (mid_x, char_h)], fill=(255, 255, 255, 40), width=2)
+    canvas.alpha_composite(div)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # VideoComposer
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -702,112 +879,155 @@ class VideoComposer:
         width: int = 1280,
         height: int = 720,
         fps: int = 25,
-        room_bg_path: str | None = None,       # legacy path-based option
-        room_bg_image: Image.Image | None = None,   # pre-generated PIL image
-        char_body_paths: dict | None = None,   # {name: path_or_None}
+        room_bg_path: str | None = None,       # kept for API compat (unused)
+        room_bg_image: Image.Image | None = None,   # kept for API compat (unused)
+        char_body_paths: dict | None = None,   # kept for API compat (unused)
+        char_names: list[str] | None = None,   # display names for name tags
     ):
-        self.width           = width
-        self.height          = height
-        self.fps             = fps
-        self.room_bg_path    = room_bg_path
-        self.room_bg_image   = room_bg_image
-        self.char_body_paths = char_body_paths or {}
-        self.char_h          = int(height * (1 - self.SUBTITLE_RATIO))
-        self.sub_h           = height - self.char_h
+        self.width       = width
+        self.height      = height
+        self.fps         = fps
+        self.char_names  = char_names or ["Alice", "Bob"]
+        self.char_h      = int(height * (1 - self.SUBTITLE_RATIO))
+        self.sub_h       = height - self.char_h
 
-        # Face bust size — tall portrait, ~36 % of frame width
-        self.fw = int(width * 0.36)
-        self.fh = int(self.fw * 1.28)
+        # ── Split-screen layout ───────────────────────────────────────────────
+        # Each character owns exactly half the horizontal space.
+        self.panel_w = width // 2
 
-        # Character centre positions (seated in sofa areas)
-        cx_l = int(width * 0.24)
-        cx_r = int(width * 0.76)
-        cy   = int(self.char_h * 0.52)
+        # Portrait fills ~88 % of panel width (natural, not tiny)
+        # Taller aspect ratio (1.45) gives a head-and-shoulders bust crop
+        self.fw = int(self.panel_w * 0.88)
+        self.fh = int(self.fw * 1.45)
+
+        # Panel x-offsets (left edge of each panel)
+        self.panel_x = [0, self.panel_w]
+
+        # Character centres: horizontal = panel mid, vertical = upper half
+        cx_l = self.panel_w // 2
+        cx_r = self.panel_w + self.panel_w // 2
+        cy   = int(self.char_h * 0.46)   # head sits in upper portion
         self.centres = [(cx_l, cy), (cx_r, cy)]
 
-        # Coffee-cup anchor — below & slightly inward from each character centre
-        cup_off_x = int(self.fw * 0.22)   # inward horizontal offset
-        cup_rest_y = cy + int(self.fh * 0.40)   # hand/lap level
-        cup_mouth_y = cy + int(self.fh * 0.13)  # mouth/chin level
+        # Coffee cup — appears near bottom of each panel (desk level)
+        cup_off_x   = int(self.fw * 0.24)
+        cup_rest_y  = int(self.char_h * 0.80)
+        cup_mouth_y = cy + int(self.fh * 0.10)
         self.cup_rest = [
             (cx_l + cup_off_x, cup_rest_y),
             (cx_r - cup_off_x, cup_rest_y),
         ]
         self.cup_mouth = [
-            (cx_l + int(cup_off_x * 0.4), cup_mouth_y),
-            (cx_r - int(cup_off_x * 0.4), cup_mouth_y),
+            (cx_l + int(cup_off_x * 0.35), cup_mouth_y),
+            (cx_r - int(cup_off_x * 0.35), cup_mouth_y),
         ]
-        self.cup_size = max(30, int(self.fw * 0.115))
+        self.cup_size = max(28, int(self.panel_w * 0.09))
+
+        # Pre-render studio panel backgrounds (expensive; done once)
+        self._panel_bgs = [
+            _make_panel_bg(self.panel_w, self.char_h, 0),
+            _make_panel_bg(self.panel_w, self.char_h, 1),
+        ]
 
     # ── build one composite PIL image (room + both faces + animation) ─────────
 
     def _build_frame(
         self,
         t: float,
-        room_bg: Image.Image,
+        room_bg: Image.Image,            # unused in split-screen mode
         listener_face: Image.Image,
         listener_idx: int,
         speaker_frame: np.ndarray,
         speaker_idx: int,
-        glow: Image.Image,
+        glow: Image.Image,               # unused in split-screen mode
         subtitle: Image.Image,
         emotion: str = "neutral",
     ) -> np.ndarray:
-        """Compose a single animated RGB frame as numpy array."""
+        """
+        Split-screen podcast compositing.
 
-        canvas = room_bg.convert("RGBA")
+        Layout
+        ──────
+          ┌──────────────┬──────────────┐
+          │  Char 0      │  Char 1      │  85 %  char area
+          │  (full panel │  (full panel │
+          │   portrait)  │   portrait)  │
+          ├──────────────┴──────────────┤
+          │      Subtitle bar           │  15 %
+          └─────────────────────────────┘
 
-        # ── 1. Coffee cups FIRST — faces composited on top ────────────────────
+        Each character fills their entire panel (natural talking-head look).
+        The active speaker gets a coloured pulsing border.
+        Listener shows emotion expressions + animated head movement.
+        """
+        # ── Base: two studio panel backgrounds side by side ───────────────────
+        canvas = Image.new("RGBA", (self.width, self.char_h))
+        canvas.paste(self._panel_bgs[0].convert("RGBA"), (0, 0))
+        canvas.paste(self._panel_bgs[1].convert("RGBA"), (self.panel_w, 0))
+
+        # ── Per-character face rendering ──────────────────────────────────────
+        for char_idx in (listener_idx, speaker_idx):
+            is_spk   = (char_idx == speaker_idx)
+            cx, cy   = self.centres[char_idx]
+            px0      = self.panel_x[char_idx]
+
+            if is_spk:
+                # Speaker: use Wav2Lip animated frame
+                scale   = _breathing_scale(t, char_idx, is_speaking=True)
+                sdx, sdy = _sway_offset(t, char_idx, is_speaking=True, emotion=emotion)
+                sw = max(1, int(self.fw * scale))
+                sh = max(1, int(self.fh * scale))
+                face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
+                _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
+            else:
+                # Listener: static portrait with breathing + emotion animation
+                nod_dy      = _listener_nod(t, char_idx, emotion=emotion)
+                l_face, ldx, ldy = _animate_face(
+                    listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
+                )
+                ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
+                _blend_panel_face(canvas, l_face, px0,
+                                  cy + ldy2 + nod_dy,
+                                  l_face.width, l_face.height)
+                # Expression overlays (brows, blush, smile, etc.)
+                _draw_expression(
+                    canvas,
+                    cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
+                    fw=self.fw, fh=self.fh,
+                    emotion=emotion, t=t, char_idx=char_idx,
+                )
+
+        # ── Coffee cups (drawn after faces so hand/cup is in front) ──────────
         for char_idx, is_spk in ((listener_idx, False), (speaker_idx, True)):
-            lift        = _sip_lift(t, char_idx, is_spk)
-            rx, ry      = self.cup_rest[char_idx]
-            mx, my      = self.cup_mouth[char_idx]
-            cup_cx      = int(rx + lift * (mx - rx))
-            cup_cy      = int(ry + lift * (my - ry))
-            _draw_coffee_cup(canvas, cup_cx, cup_cy,
-                             size=self.cup_size, t=t,
-                             char_idx=char_idx, lift=lift)
+            lift   = _sip_lift(t, char_idx, is_spk)
+            rx, ry = self.cup_rest[char_idx]
+            mx, my = self.cup_mouth[char_idx]
+            _draw_coffee_cup(
+                canvas,
+                int(rx + lift * (mx - rx)),
+                int(ry + lift * (my - ry)),
+                size=self.cup_size, t=t,
+                char_idx=char_idx, lift=lift,
+            )
 
-        # ── 2. Listener — animated portrait (on top of cup) ──────────────────
-        lcx, lcy = self.centres[listener_idx]
-        nod_dy   = _listener_nod(t, listener_idx, emotion=emotion)
-        l_face, ldx, ldy = _animate_face(
-            listener_face, self.fw, self.fh, t, listener_idx, is_speaking=False
-        )
-        # Emotion-driven sway for listener
-        ldx2, ldy2 = _sway_offset(t, listener_idx, is_speaking=False, emotion=emotion)
-        _blend_face(canvas, l_face,
-                    lcx + ldx2, lcy + ldy2 + nod_dy,
-                    l_face.width, l_face.height)
+        # ── Speaker panel border ──────────────────────────────────────────────
+        _draw_speaker_border(canvas, self.panel_x[speaker_idx],
+                             self.panel_w, self.char_h, t, speaker_idx)
 
-        # ── 2b. Expression overlay on listener ───────────────────────────────
-        _draw_expression(
-            canvas,
-            cx=lcx + ldx2, cy=lcy + ldy2 + nod_dy,
-            fw=self.fw, fh=self.fh,
-            emotion=emotion,
-            t=t,
-            char_idx=listener_idx,
-        )
+        # ── Name tags ─────────────────────────────────────────────────────────
+        for char_idx in (listener_idx, speaker_idx):
+            is_spk = (char_idx == speaker_idx)
+            name   = (self.char_names[char_idx]
+                      if char_idx < len(self.char_names)
+                      else f"Speaker {char_idx + 1}")
+            _draw_name_tag(canvas, self.panel_x[char_idx], self.panel_w,
+                           self.char_h, name, is_spk, char_idx)
 
-        # ── 3. Speaker glow halo ──────────────────────────────────────────────
-        scx, scy = self.centres[speaker_idx]
-        sdx, sdy = _sway_offset(t, speaker_idx, is_speaking=True, emotion=emotion)
-        gx = scx - self.fw // 2 + sdx
-        gy = scy - self.fh // 2 + sdy
-        canvas.alpha_composite(glow, (max(0, gx), max(0, gy)))
+        # ── Panel divider ─────────────────────────────────────────────────────
+        _draw_divider(canvas, self.char_h)
 
-        # ── 4. Speaker — Wav2Lip frame + breathing scale ──────────────────────
-        scale = _breathing_scale(t, speaker_idx, is_speaking=True)
-        spk_img = Image.fromarray(speaker_frame)
-        sw = max(1, int(self.fw * scale))
-        sh = max(1, int(self.fh * scale))
-        spk_img = spk_img.resize((sw, sh), Image.LANCZOS)
-        _blend_face(canvas, spk_img,
-                    scx + sdx, scy + sdy, sw, sh)
-
-        # ── 5. Full frame composite ───────────────────────────────────────────
-        full = Image.new("RGB", (self.width, self.height), (10, 8, 16))
+        # ── Assemble final frame (char area + subtitle bar) ───────────────────
+        full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
         full.paste(canvas.convert("RGB"), (0, 0))
         full.paste(subtitle, (0, self.char_h))
 
@@ -860,13 +1080,12 @@ class VideoComposer:
         duration = max(audio_dur, 0.5)
 
         # ── Pre-build static per-segment resources ────────────────────────────
-        if self.room_bg_image is not None:
-            room_bg = self.room_bg_image.resize((self.width, self.char_h), Image.LANCZOS)
-        else:
-            room_bg = _get_room_bg(self.width, self.char_h, self.room_bg_path)
+        # room_bg and glow are no longer used in split-screen mode;
+        # pass None placeholders so _build_frame signature stays compatible.
+        room_bg_placeholder = None
+        glow_placeholder    = None
 
         listener_face = Image.open(face_image_paths[listener_idx]).convert("RGB")
-        glow          = _speaker_glow(self.fw, self.fh)
         subtitle      = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
         # Detect the emotional tone of this line so the listener reacts
@@ -877,8 +1096,8 @@ class VideoComposer:
             safe_t    = max(0.0, min(t, wav2lip_dur - 1.0 / max(1, self.fps)))
             spk_frame = talking.get_frame(safe_t)
             return self._build_frame(
-                t, room_bg, listener_face, listener_idx,
-                spk_frame, speaker_idx, glow, subtitle,
+                t, room_bg_placeholder, listener_face, listener_idx,
+                spk_frame, speaker_idx, glow_placeholder, subtitle,
                 emotion=emotion,
             )
 

@@ -239,8 +239,7 @@ def main():
 
     composer       = VideoComposer(
         args.width, args.height, args.fps,
-        room_bg_image   = room_img,
-        char_body_paths = char_body_paths,
+        char_names = char_names,
     )
     segment_paths  = []
     tmp_dir        = tempfile.mkdtemp(prefix="ttv_")
