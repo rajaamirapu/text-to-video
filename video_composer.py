@@ -626,155 +626,228 @@ def _draw_scene_attention_glow(frame: Image.Image,
     return canvas.convert("RGB")
 
 
+def _build_hand_icon(size: int = 200) -> Image.Image:
+    """
+    Build a realistic open-palm raised-hand RGBA image at the requested pixel
+    size using bezier-curve outlines.
+
+    The hand is drawn at `size` × `size` pixels with a transparent background.
+    Returns a PIL RGBA Image.  The result is cached in `_HAND_ICON_CACHE`.
+
+    Shape
+    ─────
+    • Palm: rounded filled polygon
+    • 4 fingers (pinky → index): cubic bezier outlines, tapered tips,
+      rounded fingernails, two knuckle creases per finger
+    • Thumb: diagonal bezier, same style
+    • Subtle highlight ellipse on palm, drop shadow underneath
+    """
+
+    def _bez4(p0, p1, p2, p3, n=30):
+        t = np.linspace(0, 1, n)[:, None]
+        pts = ((1-t)**3 * np.array(p0) + 3*(1-t)**2*t * np.array(p1) +
+               3*(1-t)*t**2 * np.array(p2) + t**3 * np.array(p3))
+        return [(int(x), int(y)) for x, y in pts]
+
+    S = size
+    C_SKIN  = (218, 175, 125)
+    C_LIGHT = (235, 198, 150)
+    C_DARK  = (162, 118, 70)
+    C_NAIL  = (228, 200, 178)
+
+    # ── Palm ──────────────────────────────────────────────────────────────────
+    pcx, pcy = int(S * 0.46), int(S * 0.72)
+    pw  = int(S * 0.40)     # half-width
+    ph  = int(S * 0.28)     # half-height
+
+    palm_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    pd         = ImageDraw.Draw(palm_layer)
+
+    top_y = pcy - ph + 6
+    # Bottom arch
+    bot = _bez4((pcx-pw, pcy+ph//2), (pcx-pw//2, pcy+ph),
+                (pcx+pw//2, pcy+ph), (pcx+pw-10, pcy+ph//2))
+    # Left edge
+    lft = _bez4((pcx-pw, pcy+ph//2), (pcx-pw-4, pcy),
+                (pcx-pw, pcy-ph//3), (pcx-int(pw*0.75), top_y))
+    # Right edge (thumb notch)
+    rgt = _bez4((pcx+pw-10, pcy+ph//2), (pcx+pw+4, pcy+ph//6),
+                (pcx+pw+2, pcy-ph//4), (pcx+int(pw*0.60), top_y))
+
+    palm_poly = lft + [(pcx+int(pw*0.60), top_y), (pcx-int(pw*0.75), top_y)] + lft[-1:] + bot[::-1] + rgt[::-1]
+    pd.polygon(lft + [(pcx-int(pw*0.75), top_y), (pcx+int(pw*0.60), top_y)]
+               + rgt[::-1] + bot[::-1],
+               fill=(*C_SKIN, 255))
+
+    # ── Fingers ───────────────────────────────────────────────────────────────
+    finger_defs = [
+        # pinky
+        dict(bx=pcx-int(pw*0.68), by=top_y+4,
+             c1=(pcx-int(pw*0.70), int(S*0.38)),
+             c2=(pcx-int(pw*0.65), int(S*0.22)),
+             tx=pcx-int(pw*0.63), ty=int(S*0.15), hwb=7, hwt=5),
+        # ring
+        dict(bx=pcx-int(pw*0.28), by=top_y,
+             c1=(pcx-int(pw*0.28), int(S*0.34)),
+             c2=(pcx-int(pw*0.24), int(S*0.16)),
+             tx=pcx-int(pw*0.22), ty=int(S*0.09), hwb=9, hwt=6),
+        # middle (tallest)
+        dict(bx=pcx+int(pw*0.06), by=top_y-4,
+             c1=(pcx+int(pw*0.06), int(S*0.31)),
+             c2=(pcx+int(pw*0.08), int(S*0.12)),
+             tx=pcx+int(pw*0.08), ty=int(S*0.05), hwb=9, hwt=7),
+        # index
+        dict(bx=pcx+int(pw*0.40), by=top_y+2,
+             c1=(pcx+int(pw*0.42), int(S*0.33)),
+             c2=(pcx+int(pw*0.46), int(S*0.16)),
+             tx=pcx+int(pw*0.46), ty=int(S*0.10), hwb=9, hwt=6),
+    ]
+
+    fing_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    fd         = ImageDraw.Draw(fing_layer)
+
+    for f in finger_defs:
+        bx, by, tx, ty   = f['bx'], f['by'], f['tx'], f['ty']
+        hwb, hwt          = f['hwb'], f['hwt']
+        c1, c2            = f['c1'],  f['c2']
+        L   = _bez4((bx-hwb, by),  (c1[0]-hwb+1, c1[1]),
+                    (c2[0]-hwt,   c2[1]),  (tx-hwt, ty))
+        R   = _bez4((tx+hwt, ty),  (c2[0]+hwt, c2[1]),
+                    (c1[0]+hwb-1, c1[1]),  (bx+hwb, by))
+        tip = [(int(tx + hwt*np.cos(a)), int(ty + hwt*np.sin(a)))
+               for a in np.linspace(np.pi, 0, 12)]
+        fd.polygon(L + tip + R, fill=(*C_SKIN, 255), outline=(*C_DARK, 180))
+        # Fingernail
+        nw, nh = hwt-2, hwt-1
+        fd.ellipse([tx-nw, ty-nh*2, tx+nw, ty], fill=(*C_NAIL, 210))
+        # Two knuckle creases
+        for frac in (0.33, 0.66):
+            jx = bx + int((tx-bx)*frac)
+            jy = by + int((ty-by)*frac)
+            jw = max(3, hwb - int((hwb-hwt)*frac) - 1)
+            fd.arc([jx-jw, jy-2, jx+jw, jy+2], 195, 345,
+                   fill=(*C_DARK, 65), width=1)
+
+    # ── Thumb ─────────────────────────────────────────────────────────────────
+    thumb_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    td          = ImageDraw.Draw(thumb_layer)
+    tbx, tby    = pcx+int(pw*0.62), pcy-int(ph*0.55)
+    ttx, tty    = pcx+int(pw*1.05), pcy-int(ph*1.20)
+    hwb2, hwt2  = 9, 7
+    half        = ((tbx+ttx)//2, (tby+tty)//2)
+    L   = _bez4((tbx-hwb2+2, tby+5), (tbx-4, half[1]),
+                (ttx-hwt2-2, half[1]-6), (ttx-hwt2, tty))
+    R   = _bez4((ttx+hwt2, tty), (ttx+hwt2+2, half[1]-6),
+                (tbx+4, half[1]), (tbx+hwb2-2, tby+5))
+    tip = [(int(ttx + hwt2*np.cos(a)), int(tty + hwt2*np.sin(a)))
+           for a in np.linspace(np.pi, 0, 10)]
+    td.polygon(L + tip + R, fill=(*C_SKIN, 255), outline=(*C_DARK, 180))
+    td.ellipse([ttx-hwt2+1, tty-hwt2*2, ttx+hwt2-1, tty],
+               fill=(*C_NAIL, 200))
+
+    # ── Assemble: palm → fingers → thumb ─────────────────────────────────────
+    result = palm_layer
+    result = Image.alpha_composite(result, fing_layer)
+    result = Image.alpha_composite(result, thumb_layer)
+
+    # ── Palm highlight (soft bright ellipse centre-top) ───────────────────────
+    hl = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(hl)
+    hd.ellipse([pcx-pw//2, pcy-ph, pcx+pw//2, pcy+ph//3],
+               fill=(*C_LIGHT, 40))
+    hl = hl.filter(ImageFilter.GaussianBlur(10))
+    result = Image.alpha_composite(result, hl)
+
+    # ── Drop shadow at base ───────────────────────────────────────────────────
+    shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    sd     = ImageDraw.Draw(shadow)
+    sd.ellipse([pcx-pw+8, pcy+ph-4, pcx+pw-20, S-2], fill=(0, 0, 0, 70))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(6))
+    final  = Image.alpha_composite(shadow, result)
+
+    # Slight smooth pass for sub-pixel quality
+    return final.filter(ImageFilter.GaussianBlur(0.6))
+
+
+# Module-level cache: {size: RGBA Image}  — rebuilt once per unique size
+_HAND_ICON_CACHE: dict = {}
+
+
+def _get_hand_icon(size: int) -> Image.Image:
+    """Return (and cache) the hand icon at the requested pixel size."""
+    if size not in _HAND_ICON_CACHE:
+        _HAND_ICON_CACHE[size] = _build_hand_icon(size)
+    return _HAND_ICON_CACHE[size]
+
+
 def _draw_listening_hand(canvas: Image.Image,
                           panel_x0: int, panel_w: int, char_h: int,
                           t: float, char_idx: int,
                           skin: tuple = (210, 170, 120)) -> None:
     """
-    Draw a small "open-palm / raised hand" icon in the lower-outer corner of
-    the listener's panel to signal listening mode.
+    Composite the pre-built realistic raised-hand icon onto *canvas* (RGBA) in
+    the lower-inner corner of the listener's panel.
 
-    Visual design
-    ─────────────
-    •  Palm: filled rounded ellipse (skin tone)
-    •  4 fingers: slim rounded rectangles fanning slightly outward from palm top
-    •  Thumb: shorter angled rectangle on the side
-    •  Faint drop-shadow for depth
-    •  Whole icon scales in/out with a slow 0.28 Hz breath pulse
-    •  Icon sits in the bottom outer corner so it never overlaps the face
+    The icon breathes at 0.28 Hz (scales ±12 %) and fades 70 → 220 alpha to
+    give a gentle "active listening" pulse without being distracting.
 
     Parameters
     ──────────
-    canvas   : RGBA image to draw onto
-    panel_x0 : left edge of this character's panel (px)
-    panel_w  : width of one panel (px)
-    char_h   : height of the character area (px)
-    t        : current time (seconds)
-    char_idx : 0 or 1 — used for phase offset so the two hands pulse independently
-    skin     : base skin RGB tuple
+    canvas   : RGBA PIL Image to draw onto (modified in-place)
+    panel_x0 : left pixel edge of this character's panel
+    panel_w  : width of the panel
+    char_h   : height of the character area (bottom y-coordinate)
+    t        : current playback time in seconds
+    char_idx : 0 or 1 (controls phase + thumb-side mirror)
+    skin     : ignored — hand uses its own built-in skin palette
     """
-    phase  = _CHAR_PHASE[char_idx % 2]
-    # Slow breath pulse 0.28 Hz: scale between 0.88 … 1.12
-    pulse  = 0.5 + 0.5 * math.sin(2 * math.pi * 0.28 * t + phase)
-    scale  = 0.88 + 0.24 * pulse            # 0.88 → 1.12
+    phase = _CHAR_PHASE[char_idx % 2]
+    pulse = 0.5 + 0.5 * math.sin(2 * math.pi * 0.28 * t + phase)  # [0 … 1]
 
-    # ── size & position ───────────────────────────────────────────────────────
-    # Icon size is proportional to panel width (≈ 11 %)
-    base_size = max(28, int(panel_w * 0.11))
-    sz  = int(base_size * scale)            # scaled palm half-size (radius)
-    hw  = max(1, int(sz * 0.55))            # palm half-width
-    hh  = max(1, int(sz * 0.65))            # palm half-height
+    # ── Target icon size: ~14 % of panel width ────────────────────────────────
+    base_px  = max(40, int(panel_w * 0.14))
+    icon_px  = max(32, int(base_px * (0.88 + 0.24 * pulse)))    # 0.88 … 1.12 scale
 
-    # Position: bottom-outer corner, slight inset
-    margin = max(8, int(panel_w * 0.06))
-    # Outer edge = right side for char 0 (left panel), left side for char 1
+    hand = _get_hand_icon(200)                 # rendered at 200 px master
+    hand = hand.resize((icon_px, icon_px), Image.LANCZOS)
+
+    # ── Mirror for char 1 (thumb appears on correct side) ────────────────────
+    if char_idx == 1:
+        hand = hand.transpose(Image.FLIP_LEFT_RIGHT)
+
+    # ── Opacity pulse (130 … 220) — floor at 130 so hand stays visible ────────
+    alpha_scale = int(130 + 90 * pulse)
+    r, g, b, a  = hand.split()
+    a            = a.point(lambda px: min(255, int(px * alpha_scale / 220)))
+    hand         = Image.merge("RGBA", (r, g, b, a))
+
+    # ── Position: lower-inner corner of the panel ─────────────────────────────
+    margin = max(6, int(panel_w * 0.05))
     if char_idx == 0:
-        cx = panel_x0 + panel_w - margin - hw  # right side of left panel
+        # Left panel → place on right (inner) side
+        x = panel_x0 + panel_w - margin - icon_px
     else:
-        cx = panel_x0 + margin + hw             # left side of right panel
-    cy = char_h - margin - hh - int(sz * 1.6)  # above the name tag area
+        # Right panel → place on left (inner) side
+        x = panel_x0 + margin
 
-    # ── helper: draw rounded rect on a draw object ────────────────────────────
-    def _rrect(draw_obj, x0, y0, x1, y1, r, fill):
-        r = max(1, min(r, (x1 - x0) // 2, (y1 - y0) // 2))
-        draw_obj.rounded_rectangle([x0, y0, x1, y1], radius=r, fill=fill)
+    # Vertically: above the name-tag zone (bottom ~12 % of char_h)
+    name_tag_h = int(char_h * 0.12)
+    y = char_h - name_tag_h - icon_px - int(char_h * 0.02)
 
-    # ── alpha (opacity) follows pulse, fully visible at peak ──────────────────
-    alpha_base = 200
-    alpha = max(60, int(alpha_base * (0.6 + 0.4 * pulse)))
-
-    # ── draw shadow ───────────────────────────────────────────────────────────
-    shadow_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow_layer)
-    shx, shy = 2, 3
-    sd.ellipse([cx - hw + shx, cy - hh + shy,
-                cx + hw + shx, cy + hh + shy],
-               fill=(0, 0, 0, 60))
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(3))
-    canvas.alpha_composite(shadow_layer)
-
-    # ── draw on a fresh RGBA layer so we can alpha-composite cleanly ──────────
+    # ── Composite ─────────────────────────────────────────────────────────────
+    # Paste onto full-canvas-size transparent layer then alpha_composite
     layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    d     = ImageDraw.Draw(layer)
-
-    sr, sg, sb = skin
-    # Slightly darker shading for side of palm
-    shade = (max(0, sr - 25), max(0, sg - 20), max(0, sb - 15), alpha)
-    base_fill = (sr, sg, sb, alpha)
-
-    # ── Palm ellipse ──────────────────────────────────────────────────────────
-    d.ellipse([cx - hw, cy - hh, cx + hw, cy + hh], fill=base_fill)
-
-    # ── Fingers (4): fan out from top of palm ─────────────────────────────────
-    # Finger widths/heights relative to sz
-    fw_f = max(3, int(sz * 0.18))  # finger width
-    fh_f = max(6, int(sz * 0.85))  # finger height (tall)
-
-    # Each finger has (dx_from_cx, height_multiplier, angle_offset_pixels)
-    fingers = [
-        (-int(sz * 0.36), 0.75, -int(sz * 0.10)),   # index (leftmost)
-        (-int(sz * 0.12), 1.00,  0               ),   # middle (tallest)
-        ( int(sz * 0.12), 0.95,  0               ),   # ring
-        ( int(sz * 0.36), 0.70,  int(sz * 0.08) ),   # pinky (rightmost)
-    ]
-    for (fdx, fheight_mul, fan) in fingers:
-        fx = cx + fdx
-        fh_this = max(4, int(fh_f * fheight_mul))
-        # Finger base sits at top of palm; fan shifts the bottom slightly
-        fy_top    = cy - hh - fh_this + max(1, int(sz * 0.20))
-        fy_bottom = cy - hh + max(1, int(sz * 0.20))
-        _rrect(d,
-               fx - fw_f // 2 + fan,
-               fy_top,
-               fx + fw_f // 2 + fan,
-               fy_bottom,
-               fw_f // 2,
-               base_fill)
-
-    # ── Thumb: angled, on the outer edge of the palm ─────────────────────────
-    tw = max(3, int(sz * 0.19))
-    th = max(5, int(sz * 0.55))
-    # Thumb points diagonally outward from the palm side
-    if char_idx == 0:
-        tx = cx + hw - tw // 2          # right side (away from panel centre)
-        t_angle_x = int(sz * 0.18)
-    else:
-        tx = cx - hw + tw // 2          # left side
-        t_angle_x = -int(sz * 0.18)
-    ty_top    = cy - int(sz * 0.35)
-    ty_bottom = cy + int(sz * 0.30)
-    _rrect(d,
-           tx - tw // 2 + t_angle_x,
-           ty_top,
-           tx + tw // 2 + t_angle_x,
-           ty_bottom,
-           tw // 2,
-           shade)
-
-    # ── Knuckle line: subtle arc across the top of the palm ──────────────────
-    knuckle_alpha = max(20, int(80 * pulse))
-    d.arc([cx - hw + 2, cy - hh + 2, cx + hw - 2, cy + int(sz * 0.10)],
-          start=200, end=340,
-          fill=(max(0, sr - 40), max(0, sg - 35), max(0, sb - 25), knuckle_alpha),
-          width=max(1, int(sz * 0.06)))
-
+    layer.paste(hand, (x, y), hand)
     canvas.alpha_composite(layer)
 
 
-def _draw_scene_listening_hand(frame: "np.ndarray",
+def _draw_scene_listening_hand(frame,
                                  lx1: int, ly1: int, lx2: int, ly2: int,
                                  t: float, char_idx: int,
                                  skin: tuple = (210, 170, 120)) -> Image.Image:
     """
-    Draw the listening-hand icon onto a real-photo RGB frame for
-    SingleSceneComposer.  The hand is placed in the lower-outer corner of
-    the listener's bounding box.
-
-    Parameters
-    ──────────
-    frame    : RGB PIL Image (or numpy array) of the scene
-    lx1,ly1  : top-left of listener face bbox
-    lx2,ly2  : bottom-right of listener face bbox
+    Same listening-hand overlay for SingleSceneComposer (real-photo RGB frame).
+    The hand is placed in the lower-outer corner of the listener's face bbox.
     """
     if isinstance(frame, np.ndarray):
         img = Image.fromarray(frame)
@@ -783,14 +856,12 @@ def _draw_scene_listening_hand(frame: "np.ndarray",
 
     canvas = img.convert("RGBA")
     fw_box = lx2 - lx1
-    fh_box = ly2 - ly1
 
-    # Treat the bbox as a mini-panel: place hand in its lower-outer corner
     _draw_listening_hand(
         canvas,
         panel_x0 = lx1,
         panel_w  = fw_box,
-        char_h   = ly2,          # bottom of bbox = char_h equivalent
+        char_h   = ly2,
         t        = t,
         char_idx = char_idx,
         skin     = skin,
