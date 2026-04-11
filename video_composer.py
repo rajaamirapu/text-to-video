@@ -575,20 +575,93 @@ def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> int:
 
 def _blink_alpha(t: float, char_idx: int) -> float:
     """
-    Returns 0.0 (eyes open) → 1.0 (eyes closed) following a realistic blink
-    pattern: ~4-second intervals, ~150 ms duration, fast-close / hold / fast-open.
-    Each character blinks independently (different period offsets).
+    High-quality blink model:
+    - Randomised interval (3.5 – 6.5 s) so it never feels mechanical.
+    - 130 ms total duration: fast-snap close (35%), micro-hold (20%),
+      slow ease-open (45%) — matches the actual physiology of a blink.
+    - Occasional double-blink: a second quick blink ~350 ms after the first.
+    - Each character has a different base period and phase offset so they
+      never blink in sync.
+
+    Returns 0.0 (fully open) → 1.0 (fully closed).
     """
-    period = 4.2 + char_idx * 1.3          # slightly different for each person
-    phase  = _CHAR_PHASE[char_idx % 2]
-    t_mod  = (t + phase * period / (2 * math.pi)) % period
-    dur    = 0.15                           # 150 ms total blink
-    if t_mod >= dur:
-        return 0.0
-    p = t_mod / dur
-    if p < 0.4:   return p / 0.4           # fast close
-    if p < 0.6:   return 1.0               # brief hold
-    return 1.0 - (p - 0.6) / 0.4          # fast open
+    # Per-character deterministic seed for pseudo-random interval jitter
+    import hashlib
+    seed_base = char_idx * 7919          # large prime keeps per-char distinct
+
+    eye_y   = 0                          # unused here, kept for symmetry
+    base    = 4.0 + char_idx * 1.7      # 4.0 s  /  5.7 s
+    phase   = _CHAR_PHASE[char_idx % 2]
+
+    # Build a deterministic jitter per blink cycle using integer cycle index
+    # so the same t always produces the same result (no hidden state needed).
+    # Jitter range: ±1.2 s
+    def _jitter(cycle: int) -> float:
+        h = int(hashlib.md5(f"{seed_base}_{cycle}".encode()).hexdigest()[:8], 16)
+        return ((h % 2400) - 1200) / 1000.0   # ±1.2 s
+
+    # Walk forward in time to find which blink cycle we are in
+    t_shifted = t + phase * base / (2 * math.pi)
+    cycle     = 0
+    t_acc     = 0.0
+    SINGLE_DUR = 0.130          # 130 ms primary blink
+    DOUBLE_GAP = 0.350          # gap before possible double-blink
+    DOUBLE_DUR = 0.095          # 95 ms for the quicker second blink
+    DOUBLE_PROB_SEED = 3        # every 3rd cycle is a double-blink
+
+    while True:
+        period = max(2.5, base + _jitter(cycle))
+        if t_acc + period > t_shifted:
+            break
+        t_acc += period
+        cycle += 1
+
+    t_in_cycle = t_shifted - t_acc      # time within current cycle [0, period)
+
+    def _eyelid(p: float) -> float:
+        """Normalised progress p ∈ [0,1] → lid closure 0→1→0."""
+        if p < 0.35:  return p / 0.35                        # fast snap close
+        if p < 0.55:  return 1.0                             # micro-hold
+        return 1.0 - ((p - 0.55) / 0.45) ** 0.6             # slow ease open
+
+    # Primary blink
+    if t_in_cycle < SINGLE_DUR:
+        return _eyelid(t_in_cycle / SINGLE_DUR)
+
+    # Double-blink (every DOUBLE_PROB_SEED-th cycle)
+    if cycle % DOUBLE_PROB_SEED == 0:
+        t2 = t_in_cycle - SINGLE_DUR - DOUBLE_GAP
+        if 0 <= t2 < DOUBLE_DUR:
+            return _eyelid(t2 / DOUBLE_DUR) * 0.85   # slightly softer second blink
+
+    return 0.0
+
+
+def _sample_skin_colour(canvas: Image.Image, cx: int, cy: int,
+                        fw: int, fh: int) -> tuple[int, int, int]:
+    """
+    Sample the average pixel colour from the forehead/cheek area of the portrait
+    so the eyelid overlay automatically matches the character's skin tone.
+    Falls back to a neutral value if the sample region is out of bounds.
+    """
+    # Sample a small patch from the forehead (above the eye region)
+    sx = max(0, cx - fw // 6)
+    sy = max(0, cy - int(fh * 0.32))
+    ex = min(canvas.width,  cx + fw // 6)
+    ey = min(canvas.height, cy - int(fh * 0.18))
+    if ex <= sx or ey <= sy:
+        return (210, 175, 140)
+    try:
+        patch = canvas.convert("RGB").crop((sx, sy, ex, ey))
+        arr   = np.array(patch, dtype=np.float32)
+        r, g, b = int(arr[:,:,0].mean()), int(arr[:,:,1].mean()), int(arr[:,:,2].mean())
+        # Lighten slightly — eyelid skin is often a little paler than the cheek
+        r = min(255, r + 18)
+        g = min(255, g + 12)
+        b = min(255, b + 8)
+        return (r, g, b)
+    except Exception:
+        return (210, 175, 140)
 
 
 def _draw_eye_blink(
@@ -598,25 +671,84 @@ def _draw_eye_blink(
     alpha: float,
 ) -> None:
     """
-    Overlay a semi-transparent eyelid closure at the approximate eye positions.
-    Uses a skin-toned ellipse so the blink blends naturally with the portrait.
+    High-quality eyelid closure overlay:
+    - Skin colour sampled from the actual portrait (no hardcoded tone).
+    - Upper lid travels 75 % of the eye height; lower lid 25 % — anatomically
+      correct (blinks are mostly upper-lid movement).
+    - Vertical gradient on the upper lid: darker near the lash line (shadow),
+      lighter toward the brow.
+    - Thin dark lash-line arc at the bottom of the upper lid when >60 % closed.
+    - Soft horizontal feathering on the edges so the overlay blends seamlessly.
     """
     if alpha < 0.04:
         return
-    eye_y   = cy - int(fh * 0.12)
-    eye_sep = int(fw * 0.20)
-    eye_rx  = int(fw * 0.11)
-    eye_ry  = int(fh * 0.065)
-    a       = int(255 * alpha)
-    skin    = (205, 170, 135)           # neutral mid-tone skin
+
+    skin        = _sample_skin_colour(canvas, cx, cy, fw, fh)
+    eye_y       = cy - int(fh * 0.12)    # vertical centre of the eye row
+    eye_sep     = int(fw * 0.20)         # half-distance between eye centres
+    eye_rx      = int(fw * 0.115)        # half-width of each eye
+    eye_ry      = int(fh * 0.068)        # half-height of each eye opening
 
     bl = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     bd = ImageDraw.Draw(bl)
+
     for side in (-1, 1):
         ex = cx + side * eye_sep
-        bd.ellipse([ex - eye_rx, eye_y - eye_ry,
-                    ex + eye_rx, eye_y + eye_ry],
-                   fill=(*skin, a))
+
+        # ── Upper eyelid (75 % of alpha travel) ──────────────────────────────
+        upper_drop = int(eye_ry * 2 * alpha * 0.75)  # pixels the lid descends
+        if upper_drop > 0:
+            # Gradient: draw horizontal slices from top (lighter) to bottom (darker)
+            for row in range(upper_drop):
+                frac     = row / max(1, upper_drop)
+                # Darken near the lash line
+                shade    = int(255 * (1.0 - frac * 0.30))
+                lid_r    = min(255, int(skin[0] * shade / 255))
+                lid_g    = min(255, int(skin[1] * shade / 255))
+                lid_b    = min(255, int(skin[2] * shade / 255))
+                # Horizontal feathering: full opacity in centre, fade at edges
+                row_y    = eye_y - eye_ry + row
+                # clip to ellipse width at this row
+                ry_frac  = abs(row - eye_ry) / max(1, eye_ry)
+                row_rx   = max(1, int(eye_rx * math.sqrt(max(0.0, 1 - ry_frac ** 2))))
+                a_row    = int(255 * alpha * min(1.0, (upper_drop - row) / max(1, upper_drop * 0.15) ))
+                a_row    = min(int(255 * alpha), a_row)
+                bd.line(
+                    [(ex - row_rx, row_y), (ex + row_rx, row_y)],
+                    fill=(lid_r, lid_g, lid_b, a_row),
+                )
+
+        # ── Lower eyelid (25 % travel upward) ────────────────────────────────
+        lower_rise = int(eye_ry * 2 * alpha * 0.25)
+        if lower_rise > 0:
+            for row in range(lower_rise):
+                frac  = row / max(1, lower_rise)
+                shade = int(255 * (0.92 + frac * 0.05))
+                lid_r = min(255, int(skin[0] * shade / 255))
+                lid_g = min(255, int(skin[1] * shade / 255))
+                lid_b = min(255, int(skin[2] * shade / 255))
+                row_y = eye_y + eye_ry - row
+                ry_frac  = abs(eye_ry - row) / max(1, eye_ry)
+                row_rx   = max(1, int(eye_rx * math.sqrt(max(0.0, 1 - ry_frac ** 2))))
+                a_row    = int(255 * alpha * 0.85)
+                bd.line(
+                    [(ex - row_rx, row_y), (ex + row_rx, row_y)],
+                    fill=(lid_r, lid_g, lid_b, a_row),
+                )
+
+        # ── Lash-line shadow arc (only when mostly closed) ───────────────────
+        if alpha > 0.55:
+            lash_y   = eye_y - eye_ry + int(eye_ry * 2 * alpha * 0.75)
+            lash_a   = int(180 * min(1.0, (alpha - 0.55) / 0.35))
+            lash_th  = max(1, int(fh * 0.008))
+            bd.arc(
+                [ex - eye_rx, lash_y - lash_th * 2,
+                 ex + eye_rx, lash_y + lash_th * 2],
+                start=190, end=350,
+                fill=(30, 20, 15, lash_a),
+                width=lash_th,
+            )
+
     canvas.alpha_composite(bl)
 
 
