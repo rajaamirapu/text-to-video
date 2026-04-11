@@ -336,17 +336,25 @@ def main():
     )
     parser.add_argument(
         "--opensora-resolution",
-        default="480p",
+        default="240p",
         choices=["240p", "360p", "480p", "720p"],
-        help="Open-Sora output resolution (default: 480p). "
-             "Higher resolutions require more VRAM and time.",
+        help=(
+            "Open-Sora output resolution (default: 240p).\n"
+            "  240p — ≤16 GB VRAM  (~14 GB peak)\n"
+            "  360p — ≤20 GB VRAM\n"
+            "  480p — ≤24 GB VRAM\n"
+            "  720p — ≥32 GB VRAM"
+        ),
     )
     parser.add_argument(
         "--opensora-frames",
         type=int,
-        default=49,
-        help="Number of frames per Open-Sora clip (default: 49 ≈ 2 s at 24 fps). "
-             "Must be 4k+1: 17, 33, 49, 65, 97 …",
+        default=17,
+        help=(
+            "Frames per Open-Sora clip (default: 17 — minimum for ≤16 GB VRAM). "
+            "Must be 4k+1: 17, 33, 49, 65, 97 …  "
+            "More frames = longer clip but much higher VRAM usage."
+        ),
     )
     parser.add_argument(
         "--opensora-cli",

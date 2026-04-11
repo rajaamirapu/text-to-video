@@ -54,6 +54,80 @@ MIN_VRAM_GB = 16
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# torch major.minor → compatible torchvision version
+_TORCHVISION_COMPAT: dict[str, str] = {
+    "2.0": "0.15.2",
+    "2.1": "0.16.2",
+    "2.2": "0.17.2",
+    "2.3": "0.18.1",
+    "2.4": "0.19.1",
+    "2.5": "0.20.1",
+    "2.6": "0.21.0",
+}
+# torch major.minor → compatible torchaudio version (used by some OS deps)
+_TORCHAUDIO_COMPAT: dict[str, str] = {
+    "2.0": "2.0.2",
+    "2.1": "2.1.2",
+    "2.2": "2.2.2",
+    "2.3": "2.3.0",
+    "2.4": "2.4.1",
+    "2.5": "2.5.1",
+    "2.6": "2.6.0",
+}
+
+
+def _get_torch_version() -> tuple[str, str]:
+    """
+    Return (full_version, major_minor), e.g. ('2.5.1', '2.5').
+    Falls back to ('2.2.2', '2.2') if torch isn't importable.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import os; os.environ['NCCL_P2P_DISABLE']='1'; "
+         "import torch; print(torch.__version__)"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        full = result.stdout.strip().split("+")[0]   # strip +cu121 suffix
+        parts = full.split(".")
+        mm = f"{parts[0]}.{parts[1]}"
+        return full, mm
+    return "2.2.2", "2.2"
+
+
+def _check_torchvision_compat() -> bool:
+    """
+    Return True if the installed torchvision is compatible with the installed torch.
+    Incompatible torchvision causes 'partially initialized module torchvision
+    has no attribute extension' — a circular import due to internal C++ mismatch.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import os; os.environ['NCCL_P2P_DISABLE']='1'; "
+         "import torch; import torchvision; "
+         "print(torch.__version__.split('+')[0], torchvision.__version__)"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False
+    parts = result.stdout.strip().split()
+    if len(parts) < 2:
+        return False
+    tv = parts[1]
+    # Basic check: torchvision major.minor should match torch major.minor mapping
+    tv_mm = ".".join(tv.split(".")[:2])
+    torch_full, torch_mm = parts[0], ".".join(parts[0].split(".")[:2])
+    expected_tv = _TORCHVISION_COMPAT.get(torch_mm, "")
+    expected_tv_mm = ".".join(expected_tv.split(".")[:2]) if expected_tv else ""
+    if expected_tv_mm and tv_mm != expected_tv_mm:
+        print(
+            f"  torchvision: {tv} is incompatible with torch {torch_full} "
+            f"(expected {expected_tv_mm}.x)"
+        )
+        return False
+    return True
+
+
 def _check_flash_attn() -> bool:
     """
     Return True only if flash-attn is installed AND its kernel schema matches
@@ -74,13 +148,80 @@ def _check_flash_attn() -> bool:
     )
     if result.returncode == 0 and "ok" in result.stdout:
         return True
-    # Log the actual mismatch for the user's benefit
     if "schema" in result.stderr or "aten::_flash_attention_forward" in result.stderr:
         print(
             "  flash-attn: aten::_flash_attention_forward schema mismatch\n"
             f"              {result.stderr.splitlines()[0] if result.stderr else ''}"
         )
     return False
+
+
+def _check_xformers() -> bool:
+    """
+    Return True only if xformers is installed AND its C++/CUDA ops load cleanly
+    for the running (PyTorch, CUDA, Python) combination.
+
+    A common failure mode: xformers was pre-installed for a different torch/CUDA
+    (e.g. torch 2.10+cu128 / Python 3.10) but the env has torch 2.5+cu124 /
+    Python 3.12.  In this case xformers is importable but its fmha.flash module
+    calls ensure_pt_flash_ok() which raises:
+      "does not have a compatible aten::_flash_attention_forward schema"
+    This propagates up through diffusers.models.attention_processor and crashes
+    the whole Open-Sora import chain.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent("""\
+            import os
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+            os.environ["NCCL_IB_DISABLE"]  = "1"
+            import warnings
+            warnings.filterwarnings("ignore")
+            import xformers
+            import xformers.ops          # triggers C++ extension load
+            from xformers.ops import memory_efficient_attention  # needs CUDA ops
+            print("ok", xformers.__version__)
+        """)],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and "ok" in result.stdout:
+        ver = result.stdout.strip().split()[-1]
+        print(f"  xformers: {ver} — compatible ✓")
+        return True
+
+    stderr = result.stderr
+    if "schema" in stderr or "aten::_flash_attention_forward" in stderr:
+        print(
+            "  xformers: torch flash-attention schema mismatch "
+            "(xformers built for different torch version)."
+        )
+    elif "built for" in stderr or "you have" in stderr:
+        # Extract the one-liner warning e.g. "PyTorch 2.10.0+cu128 … you have 2.5.1+cu124"
+        for line in stderr.splitlines():
+            if "built for" in line or "you have" in line:
+                print(f"  xformers: version mismatch — {line.strip()}")
+                break
+    else:
+        print("  xformers: incompatible or import failed.")
+
+    return False
+
+
+def _get_torch_cuda_tag() -> str:
+    """
+    Return the cu-tag matching the installed PyTorch, e.g. 'cu124', 'cu121'.
+    Falls back to 'cu121' if detection fails.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import torch; v=torch.version.cuda or '12.1'; "
+         "tag='cu'+''.join(v.split('.')[:2]); print(tag)"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        tag = result.stdout.strip()
+        if tag.startswith("cu") and len(tag) >= 4:
+            return tag
+    return "cu121"   # safe default
 
 
 def banner(msg: str):
@@ -214,38 +355,50 @@ def _torch_loads_cleanly() -> bool:
 def install_dependencies(opensora_dir: str):
     banner("Installing Python dependencies")
 
-    # ── PyTorch 2.2.2 + CUDA 12.1 ────────────────────────────────────────────
-    # We pin to 2.2.2+cu121 because:
-    #   • It ships with NCCL 2.18.x — compatible with CUDA 12.0–12.3 on most
-    #     cloud platforms (Lightning AI, RunPod, vast.ai, Lambda …)
-    #   • Newer PyTorch (2.4+) links against NCCL 2.19+ which requires a
-    #     newer system NCCL and causes "undefined symbol: ncclCommWindowDeregister"
-    TORCH_VERSION    = "2.2.2"
-    TORCH_INDEX_URL  = "https://download.pytorch.org/whl/cu121"
+    # ── Detect installed torch and pick a compatible (torch, torchvision) pair ─
+    #
+    # We keep whatever torch is already installed unless it has an NCCL symbol
+    # error.  If the user's environment has torch 2.5.1 and we blindly install
+    # torchvision 0.17.2 we get:
+    #   "partially initialized module torchvision has no attribute extension"
+    # because torchvision 0.17.x was compiled against torch 2.2.x's C++ ABI.
+    #
+    # Compatibility matrix: torch major.minor → torchvision version
+    # (mirrors PyTorch release notes)
 
-    if _torch_loads_cleanly():
-        # Verify the version is in the safe range
-        result = subprocess.run(
-            [sys.executable, "-c", "import torch; print(torch.__version__)"],
-            capture_output=True, text=True,
-        )
-        installed = result.stdout.strip()
-        major, minor = (int(x) for x in installed.split(".")[:2])
-        if major > 2 or (major == 2 and minor > 3):
-            print(f"  PyTorch {installed} is too new (NCCL 2.19+ risk) — downgrading to 2.2.2")
+    torch_ok = _torch_loads_cleanly()
+
+    if torch_ok:
+        torch_full, torch_mm = _get_torch_version()
+        tv_version = _TORCHVISION_COMPAT.get(torch_mm, "0.17.2")
+        cu_tag      = _get_torch_cuda_tag()
+        whl_url     = f"https://download.pytorch.org/whl/{cu_tag}"
+        print(f"  Keeping torch {torch_full} ({cu_tag}) — "
+              f"will ensure torchvision {tv_version}")
+
+        # Check if torchvision is already the right version
+        if not _check_torchvision_compat():
+            print(f"  Reinstalling torchvision=={tv_version} to match torch {torch_full} …")
+            run([
+                sys.executable, "-m", "pip", "install", "--upgrade",
+                f"torchvision=={tv_version}",
+                "--index-url", whl_url,
+            ])
         else:
-            print(f"  PyTorch {installed} is compatible — skipping reinstall.")
-            # Fall through to other deps
-            goto_deps = True
-    else:
-        goto_deps = False
+            print("  torchvision: already compatible ✓")
 
-    if not goto_deps:
+    else:
+        # torch is broken (NCCL mismatch etc.) — install a known-good baseline
+        # Default to torch 2.2.2+cu121 which is stable across most cloud GPUs
+        TORCH_VERSION   = "2.2.2"
+        TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu121"
+        tv_version      = _TORCHVISION_COMPAT["2.2"]
+
         print(f"  Installing PyTorch {TORCH_VERSION} + CUDA 12.1 …")
         run([
             sys.executable, "-m", "pip", "install", "--upgrade",
             f"torch=={TORCH_VERSION}",
-            "torchvision==0.17.2",
+            f"torchvision=={tv_version}",
             "--index-url", TORCH_INDEX_URL,
         ])
 
@@ -260,38 +413,61 @@ def install_dependencies(opensora_dir: str):
     run([sys.executable, "-m", "pip", "install", "-e", opensora_dir,
          "--no-deps"])   # deps already installed above
 
-    # xformers (memory-efficient attention — strongly recommended)
-    try:
-        import xformers; print("  xformers: already installed")  # noqa: E401
-    except ImportError:
-        print("  Installing xformers …")
-        run([sys.executable, "-m", "pip", "install",
-             "xformers==0.0.25.post1",
-             "--index-url", "https://download.pytorch.org/whl/cu121"], check=False)
-
-    # ── Flash Attention 2 ─────────────────────────────────────────────────────
-    # flash-attn must be compiled for the exact (torch, CUDA) combination.
-    # A version mismatch causes:
-    #   "does not have a compatible aten::_flash_attention_forward schema"
-    # We detect that at runtime and uninstall the offending wheel.
-    # Flash-attn is purely optional — Open-Sora falls back to xformers or
-    # standard scaled-dot-product attention when it's absent.
-    flash_ok = _check_flash_attn()
-    if flash_ok:
-        print("  flash-attn: installed and schema-compatible ✓")
+    # ── flash-attn: always uninstall — too version-sensitive to auto-manage ───
+    # flash-attn must be compiled for the exact (torch + CUDA + Python) triple.
+    # Any mismatch causes "aten::_flash_attention_forward schema" crashes that
+    # propagate through xformers and diffusers.  We remove it unconditionally
+    # and let Open-Sora use xformers or PyTorch SDPA instead.
+    _fa_check = subprocess.run(
+        [sys.executable, "-m", "pip", "show", "flash-attn"],
+        capture_output=True,
+    )
+    if _fa_check.returncode == 0:
+        print("  flash-attn: removing (version-sensitive; will use xformers/SDPA) …")
+        run([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y"], check=False)
     else:
-        # Uninstall whatever broken version is there
-        _result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", "flash-attn"],
+        print("  flash-attn: not installed ✓")
+
+    # ── xformers: detect mismatch and reinstall for the correct torch+CUDA ───
+    # xformers must match (PyTorch version, CUDA version, Python version).
+    # A pre-installed xformers built for a different environment will crash
+    # the diffusers → attention_processor → xformers.ops import chain.
+    cu_tag = _get_torch_cuda_tag()   # e.g. "cu124"
+    whl_url = f"https://download.pytorch.org/whl/{cu_tag}"
+    print(f"  Detected CUDA tag: {cu_tag}  (wheel index: {whl_url})")
+
+    if _check_xformers():
+        print("  xformers: already compatible — skipping reinstall.")
+    else:
+        # Uninstall whatever is there (may or may not be installed)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "xformers", "-y"],
             capture_output=True,
         )
-        if _result.returncode == 0:
-            print("  flash-attn: schema incompatible — uninstalling …")
-            run([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y"],
-                check=False)
-            print("  flash-attn: removed.  Open-Sora will use xformers/sdp attention.")
+        print(f"  Installing xformers for torch+{cu_tag} …")
+        rc = run(
+            [sys.executable, "-m", "pip", "install", "xformers",
+             "--index-url", whl_url],
+            check=False,
+        )
+        if rc == 0:
+            # Verify it actually works now
+            if _check_xformers():
+                print("  xformers: reinstalled and verified ✓")
+            else:
+                print(
+                    "  xformers: reinstalled but still incompatible.\n"
+                    "  Open-Sora will use PyTorch SDPA (standard attention).\n"
+                    "  Performance is similar; no action needed."
+                )
+                # Remove broken xformers so it doesn't poison the import chain
+                run([sys.executable, "-m", "pip", "uninstall", "xformers", "-y"],
+                    check=False)
         else:
-            print("  flash-attn: not installed — Open-Sora will use xformers/sdp attention.")
+            print(
+                f"  xformers: install failed for {cu_tag}.\n"
+                "  Open-Sora will use PyTorch SDPA — this is fine."
+            )
 
 
 # ── Step 4: download model weights ────────────────────────────────────────────

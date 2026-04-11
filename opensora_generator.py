@@ -109,6 +109,42 @@ def _use_flash_attn() -> bool:
     return _FLASH_ATTN_AVAILABLE
 
 
+def _xformers_ok() -> bool:
+    """
+    Return True only if xformers can be imported cleanly with the running torch.
+    xformers built for a different (torch, CUDA, Python) triple will raise an
+    ImportError from xformers.ops.fmha.torch_attention_compat.ensure_pt_flash_ok
+    which propagates through diffusers and crashes the whole inference process.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent("""\
+            import os, warnings
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+            os.environ["NCCL_IB_DISABLE"]  = "1"
+            warnings.filterwarnings("ignore")
+            import xformers
+            import xformers.ops
+            print("ok")
+        """)],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0 and "ok" in result.stdout
+
+
+_XFORMERS_OK: bool | None = None
+
+
+def _xformers_available() -> bool:
+    """Cached wrapper around _xformers_ok()."""
+    global _XFORMERS_OK
+    if _XFORMERS_OK is None:
+        try:
+            _XFORMERS_OK = _xformers_ok()
+        except Exception:
+            _XFORMERS_OK = False
+    return _XFORMERS_OK
+
+
 # ── locate the Open-Sora repo ─────────────────────────────────────────────────
 
 def _find_opensora_root() -> str | None:
@@ -217,6 +253,48 @@ def _write_temp_config(
     if not flash_ok:
         print("  [OpenSora] flash-attn disabled in config (schema incompatible with torch).")
 
+    # Choose dtype: bf16 needs Ampere+ (A100, 3090, 4090 …).
+    # T4 / V100 / older GPUs only support fp16 natively; bf16 silently falls
+    # back to fp32 on those cards, doubling memory use.  We detect support.
+    dtype_check = subprocess.run(
+        [sys.executable, "-c",
+         "import os; os.environ['NCCL_P2P_DISABLE']='1'; "
+         "import torch; "
+         "d=torch.cuda.get_device_properties(0) if torch.cuda.is_available() else None; "
+         "print('bf16' if d and d.major>=8 else 'fp16')"],
+        capture_output=True, text=True,
+    )
+    dtype = dtype_check.stdout.strip() if dtype_check.returncode == 0 else "fp16"
+    if dtype == "fp16":
+        print("  [OpenSora] GPU does not support bf16 natively — using fp16.")
+
+    # Memory budget: for ≤16 GB cards lower sampling steps and VAE micro-batch.
+    vram_check = subprocess.run(
+        [sys.executable, "-c",
+         "import os; os.environ['NCCL_P2P_DISABLE']='1'; "
+         "import torch; "
+         "gb=torch.cuda.get_device_properties(0).total_memory/1024**3 "
+         "if torch.cuda.is_available() else 0; print(f'{gb:.1f}')"],
+        capture_output=True, text=True,
+    )
+    try:
+        vram_gb = float(vram_check.stdout.strip())
+    except ValueError:
+        vram_gb = 24.0   # assume large if detection fails
+
+    # Scale aggressiveness based on available VRAM
+    if vram_gb < 12:
+        num_steps, vae_micro = 15, 1
+    elif vram_gb < 16:
+        num_steps, vae_micro = 20, 1
+    elif vram_gb < 24:
+        num_steps, vae_micro = 25, 2
+    else:
+        num_steps, vae_micro = 30, 4   # default; full quality
+
+    print(f"  [OpenSora] VRAM {vram_gb:.1f} GiB → "
+          f"steps={num_steps}, vae_micro_batch={vae_micro}, dtype={dtype}")
+
     config_str = textwrap.dedent(f"""\
         # Auto-generated config for opensora_generator.py
         # Base: configs/opensora-v1-2/inference/sample_hf.py
@@ -230,13 +308,25 @@ def _write_temp_config(
         aspect_ratio  = "{aspect_ratio}"
         image_size    = ({h}, {w})
 
-        save_dir = "{save_dir}"
-        seed     = {seed}
+        save_dir   = "{save_dir}"
+        seed       = {seed}
         batch_size = 1
-        dtype    = "bf16"
+        dtype      = "{dtype}"
 
         # Prompt is passed on the command line via --prompt
         prompt = None
+
+        # ── Memory optimisations ──────────────────────────────────────────────
+        # Fewer diffusion steps: slightly lower quality but fits in VRAM.
+        # micro_batch_size: VAE decodes this many frames at once; 1 = minimum memory.
+        scheduler = dict(
+            num_sampling_steps = {num_steps},
+            cfg_scale          = 7.0,
+        )
+        vae = dict(
+            micro_frame_size  = 17,
+            micro_batch_size  = {vae_micro},
+        )
     """) + attn_override
 
     tmp_cfg = tempfile.NamedTemporaryFile(
@@ -280,11 +370,52 @@ def _run_cli(
 
     script = os.path.join(root, "scripts", "inference.py")
 
-    cmd = [
-        sys.executable, script,
-        cfg_file,
-        "--prompt", prompt,
-    ]
+    # ── Pre-import wrapper ────────────────────────────────────────────────────
+    # Write a tiny launcher that imports torch + torchvision BEFORE inference.py
+    # so both packages are fully initialized in the correct order.  Without this,
+    # a circular-import race between torchvision sub-modules can cause:
+    #   "partially initialized module 'torchvision' has no attribute 'extension'"
+    # This is especially likely when colossalai / diffusers trigger torchvision
+    # via multiple concurrent import chains.
+    wrapper_src = textwrap.dedent(f"""\
+        import os, sys, gc
+        # ── Safety env vars (must be set before importing torch) ──────────────
+        os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+        os.environ.setdefault("NCCL_IB_DISABLE",  "1")
+        # Allow the CUDA allocator to release and re-use fragmented memory
+        # instead of OOM-crashing when large contiguous blocks are needed.
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+                              "expandable_segments:True,max_split_size_mb:512")
+
+        # ── Pre-warm torch + torchvision in the correct order ─────────────────
+        import torch          # noqa: must come first
+        try:
+            import torchvision  # noqa
+        except Exception:
+            pass
+
+        # ── Release any pre-existing GPU memory before inference ──────────────
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+            print(f"  [OpenSora] GPU free before inference: {{free_gb:.2f}} GiB")
+
+        # ── Hand off to the real inference script with correct sys.argv ───────
+        sys.argv = {[script, cfg_file, "--prompt", prompt]!r}
+        with open({script!r}) as _f:
+            exec(compile(_f.read(), {script!r}, "exec"),
+                 {{"__name__": "__main__", "__file__": {script!r}}})
+    """)
+    wrapper_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix="_opensora_launch.py", prefix="ttv_",
+        dir=tmp_save_dir, delete=False,
+    )
+    wrapper_file.write(wrapper_src)
+    wrapper_file.close()
+
+    cmd = [sys.executable, wrapper_file.name]
 
     print(f"  [OpenSora] Running inference …")
     print(f"  [OpenSora] Prompt      : {prompt[:80]}")
@@ -295,12 +426,30 @@ def _run_cli(
     if root not in env.get("PYTHONPATH", ""):
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
 
-    # Disable NCCL peer-to-peer and InfiniBand paths to avoid
-    # "ncclCommWindowDeregister: undefined symbol" on systems where the
-    # PyTorch NCCL version mismatches the system NCCL library.
+    # ── NCCL ── prevent "ncclCommWindowDeregister: undefined symbol" ──────────
     env.setdefault("NCCL_P2P_DISABLE",  "1")
     env.setdefault("NCCL_IB_DISABLE",   "1")
     env.setdefault("NCCL_SHM_DISABLE",  "0")   # keep shared-mem transport
+
+    # ── CUDA allocator — prevent OOM from fragmentation ───────────────────────
+    # expandable_segments lets PyTorch grow/shrink allocations without
+    # reserving a fixed pool — critical for models with varying tensor shapes.
+    # max_split_size_mb limits the largest individual block to 512 MB so the
+    # allocator can fulfil smaller requests from the gaps.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+                   "expandable_segments:True,max_split_size_mb:512")
+
+    # ── xformers ── if xformers is installed but built for a different torch, ─
+    # diffusers will crash on import.  We test it here and, if broken, tell    ─
+    # diffusers to skip xformers by setting XFORMERS_DISABLED in the env.     ─
+    if not _xformers_available():
+        env["XFORMERS_DISABLED"] = "1"         # diffusers respects this flag
+        # Also tell colossalai not to try loading xformers
+        env["COLOSSAL_NO_XFORMERS"] = "1"
+        print(
+            "  [OpenSora] xformers disabled (schema mismatch) — "
+            "will use PyTorch SDPA.  Run setup_opensora.py to fix."
+        )
 
     result = subprocess.run(cmd, cwd=root, env=env)
 
@@ -538,9 +687,9 @@ def generate_character_video(
     gender:         str,
     facing:         str  = "forward",
     output_path:    str  = "character.mp4",
-    num_frames:     int  = 49,
+    num_frames:     int  = 17,    # 17 = minimum 4k+1; ~0.7 s at 24 fps — fits ≤16 GB VRAM
     fps:            int  = 24,
-    resolution:     str  = "480p",
+    resolution:     str  = "240p",  # 240p for ≤16 GB; raise to 360p/480p with more VRAM
     seed:           int  = 42,
     use_cli:        bool = True,
 ) -> str:
@@ -601,9 +750,9 @@ def generate_character_video(
 def generate_background_video(
     scene_description: str = "modern office lounge with warm ambient lighting",
     output_path:       str = "background.mp4",
-    num_frames:        int = 97,    # ~4 s at 24 fps
+    num_frames:        int = 33,    # 33 = 4k+1; ~1.4 s at 24 fps — looped to fill scene
     fps:               int = 24,
-    resolution:        str = "720p",
+    resolution:        str = "240p",  # upgrade to 480p/720p only on ≥24 GB VRAM
     seed:              int = 0,
     use_cli:           bool = True,
 ) -> str:
