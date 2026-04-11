@@ -1173,3 +1173,205 @@ class VideoComposer:
 
         size = os.path.getsize(output_path)
         print(f"  [Composer] ✓ Final video: {output_path}  ({size // 1024} KB)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-scene composer  (both characters in one photo, facing each other)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_scene_faces(scene: Image.Image) -> list[tuple[int, int, int, int]]:
+    """
+    Detect faces in the scene image using OpenCV Haar cascade.
+    Returns bboxes as (x1, y1, x2, y2) sorted left-to-right.
+    Falls back to simple half-split if detection fails.
+    """
+    try:
+        import cv2
+        img_bgr = cv2.cvtColor(np.array(scene), cv2.COLOR_RGB2BGR)
+        gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        faces = cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
+        )
+        if len(faces) >= 2:
+            bboxes = [(x, y, x + w, y + h) for x, y, w, h in faces]
+            bboxes.sort(key=lambda b: b[0])   # left → right
+            print(f"  [Scene] Detected {len(bboxes)} faces — using leftmost two.")
+            return bboxes[:2]
+    except Exception as e:
+        print(f"  [Scene] Face detection warning: {e}")
+
+    # Fallback: assume left person in left third, right person in right third
+    W, H = scene.size
+    fw, fh = int(W * 0.22), int(H * 0.40)
+    cy     = int(H * 0.32)
+    print("  [Scene] ⚠ Could not detect faces — using approximate positions.")
+    return [
+        (int(W * 0.10), cy, int(W * 0.10) + fw, cy + fh),
+        (int(W * 0.65), cy, int(W * 0.65) + fw, cy + fh),
+    ]
+
+
+def _padded_bbox(bbox: tuple, pad_frac: float,
+                 img_w: int, img_h: int) -> tuple[int, int, int, int]:
+    """Expand bbox by pad_frac of its size, clamped to image bounds."""
+    x1, y1, x2, y2 = bbox
+    pad = int(max(x2 - x1, y2 - y1) * pad_frac)
+    return (max(0, x1 - pad), max(0, y1 - pad),
+            min(img_w, x2 + pad), min(img_h, y2 + pad))
+
+
+def _blend_face_into_scene(
+    scene: Image.Image,
+    face_frame: np.ndarray,
+    pbbox: tuple[int, int, int, int],
+) -> Image.Image:
+    """
+    Paste an animated Wav2Lip face frame back into *scene* at *pbbox*,
+    blending the edges with a soft elliptical mask so it looks seamless.
+    """
+    x1, y1, x2, y2 = pbbox
+    tw, th = x2 - x1, y2 - y1
+    face   = Image.fromarray(face_frame).resize((tw, th), Image.LANCZOS)
+
+    # Soft elliptical blend mask
+    mask   = Image.new("L", (tw, th), 0)
+    md     = ImageDraw.Draw(mask)
+    m      = max(4, int(min(tw, th) * 0.10))   # margin for feathering
+    md.ellipse([m, m, tw - m, th - m], fill=255)
+    mask   = mask.filter(ImageFilter.GaussianBlur(radius=max(2, int(min(tw, th) * 0.07))))
+
+    result = scene.copy()
+    result.paste(face, (x1, y1), mask)
+    return result
+
+
+class SingleSceneComposer:
+    """
+    Uses ONE scene image containing both characters already posed and facing
+    each other.  Only the active speaker's face region is replaced each frame
+    with the Wav2Lip-animated version; the listener stays still in the photo.
+
+    This gives the most natural 'two people in conversation' look.
+    """
+
+    SUBTITLE_RATIO = 0.15
+
+    def __init__(
+        self,
+        scene_image_path: str,
+        char_names: list[str],
+        width: int = 1280,
+        height: int = 720,
+        fps: int = 25,
+    ):
+        self.width      = width
+        self.height     = height
+        self.fps        = fps
+        self.char_names = char_names
+        self.char_h     = int(height * (1 - self.SUBTITLE_RATIO))
+        self.sub_h      = height - self.char_h
+
+        # Load + resize scene to video dimensions
+        scene_full  = Image.open(scene_image_path).convert("RGB")
+        self.scene  = scene_full.resize((width, self.char_h), Image.LANCZOS)
+
+        # Detect face positions (sorted left-to-right = char 0, char 1)
+        raw_bboxes        = _detect_scene_faces(self.scene)
+        self.face_bboxes  = raw_bboxes[:2]
+        self._padded      = [
+            _padded_bbox(bb, 0.45, width, self.char_h)
+            for bb in self.face_bboxes
+        ]
+        for i, (bb, pb) in enumerate(zip(self.face_bboxes, self._padded)):
+            name = char_names[i] if i < len(char_names) else f"char{i}"
+            print(f"  [Scene] {name} face bbox={bb}  padded={pb}")
+
+    def get_face_crop_path(self, char_idx: int, tmp_dir: str) -> str:
+        """
+        Save the speaker's face region from the scene as a temp PNG.
+        This is passed to run_wav2lip() as the face input.
+        """
+        x1, y1, x2, y2 = self._padded[char_idx]
+        crop      = self.scene.crop((x1, y1, x2, y2))
+        crop_path = os.path.join(tmp_dir, f"scene_face_{char_idx}.png")
+        crop.save(crop_path)
+        return crop_path
+
+    def create_segment(
+        self,
+        speaker_idx: int,
+        dialogue_text: str,
+        speaker_name: str,
+        wav2lip_video_path: str,
+        audio_path: str,
+        segment_out_path: str,
+    ) -> str:
+        """
+        Render one dialogue segment.
+        The scene stays still; only the speaker's face region animates.
+        """
+        import subprocess
+        VideoFileClip, AudioFileClip, VideoClip, _ = _mp()
+
+        talking     = VideoFileClip(wav2lip_video_path)
+        wav2lip_dur = talking.duration
+
+        # Audio duration
+        audio_dur = wav2lip_dur
+        audio_ok  = os.path.exists(audio_path) and os.path.getsize(audio_path) > 256
+        if audio_ok:
+            try:
+                tmp_a     = AudioFileClip(audio_path)
+                audio_dur = tmp_a.duration
+                tmp_a.close()
+            except Exception:
+                audio_ok = False
+
+        duration = max(audio_dur, 0.5)
+        pbbox    = self._padded[speaker_idx]
+        emotion  = _detect_emotion(dialogue_text)
+        subtitle = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
+
+        print(f"  [Scene] Emotion: {emotion!r}  speaker={speaker_name}  bbox={pbbox}")
+
+        def make_frame(t: float) -> np.ndarray:
+            safe_t    = max(0.0, min(t, wav2lip_dur - 1.0 / max(1, self.fps)))
+            spk_frame = talking.get_frame(safe_t)
+            frame     = _blend_face_into_scene(self.scene, spk_frame, pbbox)
+            full      = Image.new("RGB", (self.width, self.height), (8, 8, 8))
+            full.paste(frame, (0, 0))
+            full.paste(subtitle, (0, self.char_h))
+            return np.asarray(full, dtype=np.uint8)
+
+        # Write video-only then mux audio
+        tmp_vid = segment_out_path + "_noaudio.mp4"
+        clip    = VideoClip(make_frame, duration=duration)
+        clip    = clip.with_fps(self.fps) if hasattr(clip, "with_fps") else clip.set_fps(self.fps)
+        clip.write_videofile(tmp_vid, fps=self.fps, codec="libx264",
+                             audio=False, logger=None)
+        talking.close()
+
+        if audio_ok:
+            cmd = ["ffmpeg", "-y", "-i", tmp_vid, "-i", audio_path,
+                   "-c:v", "copy", "-c:a", "aac", "-ar", "44100",
+                   "-ac", "1", "-shortest", segment_out_path]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                print(f"  [Scene] ✓ Segment: {segment_out_path}")
+            else:
+                import shutil; shutil.move(tmp_vid, segment_out_path)
+        else:
+            import shutil; shutil.move(tmp_vid, segment_out_path)
+
+        if os.path.isfile(tmp_vid):
+            try: os.unlink(tmp_vid)
+            except Exception: pass
+
+        return segment_out_path
+
+    @staticmethod
+    def concat_and_write(segment_paths: list[str], output_path: str, fps: int = 25):
+        VideoComposer.concat_and_write(segment_paths, output_path, fps)

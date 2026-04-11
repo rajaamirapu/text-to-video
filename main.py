@@ -54,6 +54,165 @@ def banner(msg: str):
     print(f"\n{'─' * w}\n  {msg}\n{'─' * w}")
 
 
+def _make_placeholder_face(
+    name: str,
+    gender: str,
+    panel_idx: int,
+    width: int = 512,
+    height: int = 512,
+) -> "Image.Image":
+    """
+    Draw a simple but clean portrait placeholder using PIL when Stable
+    Diffusion is unavailable.  Produces a head + shoulders silhouette with
+    skin tone, hair, and clothing so Wav2Lip has a usable face region.
+
+    panel_idx 0 (left)  → face turned slightly right
+    panel_idx 1 (right) → face turned slightly left
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+    import math
+
+    is_female = gender.strip().lower() in ("female", "f", "woman", "girl")
+
+    # ── Background gradient ───────────────────────────────────────────────────
+    img  = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(img)
+    bg_top    = (38, 42, 52) if panel_idx == 0 else (42, 38, 34)
+    bg_bottom = (22, 26, 34) if panel_idx == 0 else (28, 22, 18)
+    for y in range(height):
+        t = y / height
+        r = int(bg_top[0] + t * (bg_bottom[0] - bg_top[0]))
+        g = int(bg_top[1] + t * (bg_bottom[1] - bg_top[1]))
+        b = int(bg_top[2] + t * (bg_bottom[2] - bg_top[2]))
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    # ── Dimensions ────────────────────────────────────────────────────────────
+    cx      = width  // 2
+    # Subtle horizontal shift to convey inward facing
+    cx_off  = int(width * 0.04) * (1 if panel_idx == 0 else -1)
+    cx     += cx_off
+
+    head_r  = int(width * 0.22)
+    head_cy = int(height * 0.36)
+
+    # ── Shoulders / clothing ──────────────────────────────────────────────────
+    shoulder_y = int(height * 0.62)
+    shirt_col  = (55, 75, 110) if not is_female else (110, 65, 85)
+    draw.ellipse(
+        [cx - int(width * 0.46), shoulder_y,
+         cx + int(width * 0.46), height + int(height * 0.15)],
+        fill=shirt_col,
+    )
+
+    # Subtle neck
+    neck_w = int(width * 0.08)
+    neck_h = int(height * 0.10)
+    skin   = (210, 170, 130) if not is_female else (235, 195, 160)
+    draw.rectangle(
+        [cx - neck_w, head_cy + head_r - 4,
+         cx + neck_w, head_cy + head_r + neck_h],
+        fill=skin,
+    )
+
+    # ── Hair (drawn behind head) ──────────────────────────────────────────────
+    hair_col = (45, 30, 20) if not is_female else (90, 55, 30)
+    hair_r   = int(head_r * 1.08)
+    draw.ellipse(
+        [cx - hair_r, head_cy - hair_r - int(head_r * 0.18),
+         cx + hair_r, head_cy + hair_r],
+        fill=hair_col,
+    )
+    if is_female:
+        # Shoulder-length hair sides
+        for side in (-1, 1):
+            x_a = cx + side * int(head_r * 0.55)
+            x_b = cx + side * int(head_r * 1.35)
+            draw.ellipse(
+                [min(x_a, x_b), head_cy,
+                 max(x_a, x_b), head_cy + int(head_r * 1.4)],
+                fill=hair_col,
+            )
+
+    # ── Head / skin ───────────────────────────────────────────────────────────
+    draw.ellipse(
+        [cx - head_r, head_cy - head_r,
+         cx + head_r, head_cy + head_r],
+        fill=skin,
+    )
+
+    # ── Eyes ──────────────────────────────────────────────────────────────────
+    eye_y   = head_cy - int(head_r * 0.12)
+    eye_sep = int(head_r * 0.38)
+    eye_rx  = int(head_r * 0.14)
+    eye_ry  = int(head_r * 0.09)
+    for side in (-1, 1):
+        ex = cx + side * eye_sep
+        # White
+        draw.ellipse([ex - eye_rx, eye_y - eye_ry,
+                      ex + eye_rx, eye_y + eye_ry], fill=(245, 242, 238))
+        # Iris
+        draw.ellipse([ex - eye_ry, eye_y - eye_ry,
+                      ex + eye_ry, eye_y + eye_ry], fill=(60, 90, 50))
+        # Pupil
+        pr = max(2, int(eye_ry * 0.55))
+        draw.ellipse([ex - pr, eye_y - pr, ex + pr, eye_y + pr], fill=(15, 10, 8))
+
+    # ── Eyebrows ──────────────────────────────────────────────────────────────
+    brow_y = eye_y - int(head_r * 0.16)
+    brow_w = int(head_r * 0.22)
+    brow_h = max(2, int(head_r * 0.04))
+    for side in (-1, 1):
+        bx = cx + side * eye_sep
+        draw.ellipse([bx - brow_w, brow_y - brow_h,
+                      bx + brow_w, brow_y + brow_h],
+                     fill=(50, 32, 18))
+
+    # ── Nose ──────────────────────────────────────────────────────────────────
+    nose_y = head_cy + int(head_r * 0.15)
+    nose_x = cx + cx_off // 3          # subtle inward-facing offset
+    draw.ellipse([nose_x - 5, nose_y - 4,
+                  nose_x + 5, nose_y + 6],
+                 fill=(int(skin[0] * 0.88), int(skin[1] * 0.82), int(skin[2] * 0.78)))
+
+    # ── Mouth ─────────────────────────────────────────────────────────────────
+    mouth_y  = head_cy + int(head_r * 0.38)
+    mouth_w  = int(head_r * 0.28)
+    lip_col  = (185, 105, 95) if is_female else (165, 100, 90)
+    draw.arc([cx - mouth_w, mouth_y - int(head_r * 0.08),
+              cx + mouth_w, mouth_y + int(head_r * 0.10)],
+             start=5, end=175, fill=lip_col, width=max(2, int(head_r * 0.04)))
+
+    # ── Soft vignette ─────────────────────────────────────────────────────────
+    vignette = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    vd = ImageDraw.Draw(vignette)
+    for i in range(40):
+        a = int(120 * (i / 40) ** 2)
+        vd.rectangle([i, i, width - 1 - i, height - 1 - i],
+                     outline=(0, 0, 0, a))
+    img = img.convert("RGBA")
+    img.alpha_composite(vignette)
+
+    # ── Name label ────────────────────────────────────────────────────────────
+    label_y = int(height * 0.88)
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            max(14, int(height * 0.045)),
+        )
+    except Exception:
+        font = None
+    draw2 = ImageDraw.Draw(img)
+    draw2.text(
+        (cx, label_y), name,
+        fill=(220, 220, 220, 210),
+        font=font,
+        anchor="mm" if font else None,
+    )
+
+    return img.convert("RGB")
+
+
 def _generate_missing_faces(
     char_names: list,
     char_data: dict,
@@ -113,11 +272,8 @@ def _generate_missing_faces(
         print(f"  [SD] Generating face for '{name}' ({gender} {role}) …")
         img = _sd_generate(prompt, PORTRAIT_NEGATIVE, width, height, model_id=sd_model)
         if img is None:
-            sys.exit(
-                f"\n[Error] Stable Diffusion failed to generate face for '{name}'.\n"
-                f"  Make sure diffusers is installed and the model '{sd_model}' is available.\n"
-                f"  Or place your own photo at: {out_path}\n"
-            )
+            print(f"  [SD] ⚠ Stable Diffusion unavailable — using PIL placeholder for '{name}'.")
+            img = _make_placeholder_face(name, gender, char_idx_local, width, height)
         img.save(out_path)
         print(f"  ✓ {name} → {out_path}")
         face_paths[name] = out_path
@@ -142,6 +298,11 @@ def main():
                         help="Force regenerate all face images with SD")
     parser.add_argument("--regen-room",         action="store_true",
                         help="Force regenerate room background with SD")
+    parser.add_argument("--scene-image",         default=None,
+                        help="Single photo with BOTH characters already in frame "
+                             "(e.g. scene.jpg). When supplied the pipeline animates "
+                             "only the speaker's face region inside this photo — the "
+                             "most natural looking result. Skips SD face/room generation.")
     parser.add_argument("--room-bg",            default=None,
                         help="Path to a custom room background image (JPG/PNG). "
                              "Uses SD generation if omitted.")
@@ -173,87 +334,49 @@ def main():
         _run_cartoon_fallback(args, data, char_names, dialogue)
         return
 
-    # ── 3. Generate / load face images ───────────────────────────────────────
-    banner("Generating / loading face images (Stable Diffusion)")
-    face_paths    = _generate_missing_faces(
-        char_names, char_data, args.faces_dir,
-        sd_model=args.sd_model,
-        regen=args.regen_faces,
-        width=512, height=512,
-    )
-    ordered_faces = [face_paths[n] for n in char_names]
+    # ── 3. Scene image mode vs two-portrait mode ──────────────────────────────
+    from tts            import text_to_speech
+    from wav2lip_runner import run_wav2lip
+    from lip_sync       import get_audio_duration
 
-    # ── 4. Generate room background ───────────────────────────────────────────
-    banner("Generating room background (Stable Diffusion)")
-    from scene_generator import generate_room_background
+    use_scene = args.scene_image and os.path.isfile(args.scene_image)
 
-    # Delete cached file if --regen-room requested
-    if args.regen_room:
-        cache_path = os.path.join(args.faces_dir, "room_bg.png")
-        if os.path.isfile(cache_path):
-            os.remove(cache_path)
-            print(f"  Removed cached room background for regeneration.")
-
-    room_img = generate_room_background(
-        width        = args.width,
-        height       = int(args.height * 0.85),
-        model_id     = args.sd_model,
-        cache_dir    = args.faces_dir,
-        room_bg_path = args.room_bg,
-    )
-
-    # ── 5. Generate seated body images (optional enhancement) ─────────────────
-    banner("Generating character body images (Stable Diffusion)")
-    from scene_generator import generate_character_body
-
-    # Build default appearance data for body-image prompts
-    DEFAULT_APPEARANCES = [
-        {"skin_rgb": [235, 200, 170], "hair_rgb": [60, 40, 20],  "hair_style": "short"},
-        {"skin_rgb": [200, 165, 130], "hair_rgb": [140, 90, 50], "hair_style": "medium"},
-    ]
-
-    char_body_paths: dict[str, str | None] = {}
-    for idx, name in enumerate(char_names):
-        info = char_data.get(name, {})
-        app  = DEFAULT_APPEARANCES[idx % len(DEFAULT_APPEARANCES)]
-        body = generate_character_body(
-            name        = name,
-            role        = info.get("role",   "person"),
-            gender      = info.get("gender", "neutral"),
-            appearance  = app,
-            width       = int(args.width * 0.38),
-            height      = int(args.width * 0.38 * 1.28),
-            model_id    = args.sd_model,
-            cache_dir   = args.faces_dir,
-            idx         = idx,
+    if use_scene:
+        # ── Single-scene mode: one photo with both people ─────────────────────
+        banner(f"Single-scene mode  →  {args.scene_image}")
+        from video_composer import SingleSceneComposer
+        composer      = SingleSceneComposer(
+            args.scene_image, char_names,
+            args.width, args.height, args.fps,
         )
-        safe = name.lower().replace(" ", "_")
-        if body:
-            body_path = os.path.join(args.faces_dir, f"body_{safe}.png")
-            char_body_paths[name] = body_path
-        else:
-            char_body_paths[name] = None
+        ordered_faces = None   # not used; face crops come from the scene
+    else:
+        # ── Two-portrait mode: separate SD faces + split-screen ───────────────
+        banner("Generating / loading face images (Stable Diffusion)")
+        face_paths    = _generate_missing_faces(
+            char_names, char_data, args.faces_dir,
+            sd_model=args.sd_model,
+            regen=args.regen_faces,
+            width=512, height=512,
+        )
+        ordered_faces = [face_paths[n] for n in char_names]
 
-    # ── 6. Build dialogue segments ────────────────────────────────────────────
+        from video_composer import VideoComposer
+        composer = VideoComposer(
+            args.width, args.height, args.fps,
+            char_names=char_names,
+        )
+
+    # ── 4. Build dialogue segments ────────────────────────────────────────────
     banner(f"Generating {len(dialogue)} dialogue segments")
-    from tts             import text_to_speech
-    from wav2lip_runner  import run_wav2lip
-    from video_composer  import VideoComposer
-    from lip_sync        import get_audio_duration
-
-    composer       = VideoComposer(
-        args.width, args.height, args.fps,
-        char_names = char_names,
-    )
-    segment_paths  = []
-    tmp_dir        = tempfile.mkdtemp(prefix="ttv_")
+    segment_paths = []
+    tmp_dir       = tempfile.mkdtemp(prefix="ttv_")
 
     try:
         for line_idx, line in enumerate(dialogue):
             speaker      = line["speaker"]
             text         = line["text"]
             speaker_idx  = char_names.index(speaker) if speaker in char_names else 0
-            speaker_face = ordered_faces[speaker_idx]
 
             print(
                 f"\n  [{line_idx + 1}/{len(dialogue)}] "
@@ -261,7 +384,6 @@ def main():
             )
 
             # ── TTS ───────────────────────────────────────────────────────────
-            # text_to_speech always returns a WAV file
             speaker_gender = char_data.get(speaker, {}).get("gender", "male")
             audio_path = os.path.join(tmp_dir, f"line_{line_idx:03d}_audio.wav")
             audio_path = text_to_speech(
@@ -272,6 +394,13 @@ def main():
             )
 
             duration = get_audio_duration(audio_path) + args.pause
+
+            # ── Face image for Wav2Lip ─────────────────────────────────────────
+            if use_scene:
+                # Crop the speaker's face from the scene photo
+                speaker_face = composer.get_face_crop_path(speaker_idx, tmp_dir)
+            else:
+                speaker_face = ordered_faces[speaker_idx]
 
             # ── Wav2Lip (talking face) ─────────────────────────────────────────
             wav2lip_out = os.path.join(tmp_dir, f"line_{line_idx:03d}_wav2lip.mp4")
@@ -286,20 +415,30 @@ def main():
 
             # ── compose segment (writes MP4 with muxed audio immediately) ─────
             seg_out = os.path.join(tmp_dir, f"line_{line_idx:03d}_segment.mp4")
-            composer.create_segment(
-                speaker_idx        = speaker_idx,
-                dialogue_text      = text,
-                speaker_name       = speaker,
-                face_image_paths   = ordered_faces,
-                wav2lip_video_path = wav2lip_out,
-                audio_path         = audio_path,
-                segment_out_path   = seg_out,
-            )
+            if use_scene:
+                composer.create_segment(
+                    speaker_idx        = speaker_idx,
+                    dialogue_text      = text,
+                    speaker_name       = speaker,
+                    wav2lip_video_path = wav2lip_out,
+                    audio_path         = audio_path,
+                    segment_out_path   = seg_out,
+                )
+            else:
+                composer.create_segment(
+                    speaker_idx        = speaker_idx,
+                    dialogue_text      = text,
+                    speaker_name       = speaker,
+                    face_image_paths   = ordered_faces,
+                    wav2lip_video_path = wav2lip_out,
+                    audio_path         = audio_path,
+                    segment_out_path   = seg_out,
+                )
             segment_paths.append(seg_out)
 
-        # ── 7. Concatenate & export ───────────────────────────────────────────
+        # ── Concatenate & export ──────────────────────────────────────────────
         banner(f"Exporting final video → {args.output}")
-        VideoComposer.concat_and_write(segment_paths, args.output, fps=args.fps)
+        composer.concat_and_write(segment_paths, args.output, fps=args.fps)
 
     finally:
         import shutil

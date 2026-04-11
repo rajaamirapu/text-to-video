@@ -201,10 +201,21 @@ def main():
         prompt = portrait_prompt(name, role, gender, panel_idx=panel_idx)
         print(f"  → Prompt: {prompt[:90]}…")
 
-        img = generate_image(
-            pipe, prompt, NEGATIVE,
-            args.width, args.height, args.steps, args.cfg
-        )
+        try:
+            img = generate_image(
+                pipe, prompt, NEGATIVE,
+                args.width, args.height, args.steps, args.cfg
+            )
+        except Exception as e:
+            print(f"[{name}] ⚠ SD failed ({e}) — falling back to PIL placeholder.")
+            img = None
+
+        if img is None:
+            from main import _make_placeholder_face
+            img = _make_placeholder_face(name, gender, panel_idx,
+                                         args.width, args.height)
+            print(f"[{name}] ⚠ PIL placeholder generated.")
+
         img.save(out)
         print(f"[{name}] ✓ Saved → {out}  ({img.size[0]}×{img.size[1]})\n")
 
