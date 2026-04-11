@@ -580,16 +580,15 @@ def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> int:
     irr    = 0.12 * math.sin(2 * math.pi * 0.07 * t + phase * 2.3)   # irregularity
 
     if emotion == "excited":
-        freq, amp = 0.60, 18          # fast, enthusiastic
+        freq, amp = 1.00, 18          # fast, enthusiastic
     elif emotion == "surprised":
-        # Recoil: one sharp jerk backward (negative = back) then settle
-        freq, amp = 0.55, 14
+        freq, amp = 0.90, 14
     elif emotion == "thoughtful":
-        freq, amp = 0.18, 16          # slow, deliberate
+        freq, amp = 0.45, 16          # deliberate but visible
     elif emotion == "happy":
-        freq, amp = 0.40, 14
+        freq, amp = 0.75, 14
     else:
-        freq, amp = 0.28, 12          # calm, attentive
+        freq, amp = 0.55, 12          # calm, attentive — noticeably faster
 
     p  = (t * freq + phase / (2 * math.pi)) % 1.0
     dy = _nod_curve(p) * amp * (1.0 + irr)
