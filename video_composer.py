@@ -553,24 +553,47 @@ def _sway_offset(
     return int(dx), int(dy)
 
 
+def _nod_curve(p: float) -> float:
+    """
+    Asymmetric nod shape: slow lean-down (0→0.6), quick snap-up (0.6→1.0).
+    Maps normalised cycle phase p ∈ [0, 1] → displacement ∈ [-1, 0].
+    Negative = downward (chin toward chest, natural listening nod).
+    """
+    if p < 0.6:
+        # smooth ease-in downward: sine easing
+        return -math.sin(math.pi * p / 1.2)
+    else:
+        # quick spring back
+        q = (p - 0.6) / 0.4
+        return -(1.0 - q) * math.sin(math.pi * 0.5)
+
+
 def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> int:
     """
-    Slow occasional head-nod for the listener — y-axis only.
-    Amplitude and frequency scale with emotion.
+    Natural-looking head nod for the listener.
+
+    Uses an asymmetric curve: slow lean-down, quick spring-back — exactly
+    how real nods look. Amplitude and rate scale with emotion.
+    A second harmonic adds slight irregularity so it never feels looped.
     """
-    phase = _CHAR_PHASE[char_idx % 2]
+    phase  = _CHAR_PHASE[char_idx % 2]
+    irr    = 0.12 * math.sin(2 * math.pi * 0.07 * t + phase * 2.3)   # irregularity
+
     if emotion == "excited":
-        # Faster, bigger nod — enthusiastic agreement
-        return int(7 * math.sin(2 * math.pi * 0.55 * t + phase))
+        freq, amp = 0.60, 18          # fast, enthusiastic
     elif emotion == "surprised":
-        # Quick recoil-style jerk
-        return int(6 * abs(math.sin(2 * math.pi * 0.70 * t + phase)))
+        # Recoil: one sharp jerk backward (negative = back) then settle
+        freq, amp = 0.55, 14
     elif emotion == "thoughtful":
-        # Slow, deep single nod
-        return int(5 * math.sin(2 * math.pi * 0.18 * t + phase))
+        freq, amp = 0.18, 16          # slow, deliberate
+    elif emotion == "happy":
+        freq, amp = 0.40, 14
     else:
-        # Default gentle nod
-        return int(4 * math.sin(2 * math.pi * 0.25 * t + phase))
+        freq, amp = 0.28, 12          # calm, attentive
+
+    p  = (t * freq + phase / (2 * math.pi)) % 1.0
+    dy = _nod_curve(p) * amp * (1.0 + irr)
+    return int(dy)
 
 
 def _blink_alpha(t: float, char_idx: int) -> float:
@@ -1194,7 +1217,7 @@ class VideoComposer:
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
-                # Listener: animated portrait with nod, sway, and expressions
+                # Listener: head nod + breathing sway only — no overlays on real faces
                 nod_dy           = _listener_nod(t, char_idx, emotion=emotion)
                 l_face, ldx, ldy = _animate_face(
                     listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
@@ -1203,29 +1226,6 @@ class VideoComposer:
                 _blend_panel_face(canvas, l_face, px0,
                                   cy + ldy2 + nod_dy,
                                   l_face.width, l_face.height)
-                # Expression overlays (raised brows, blush, smile, etc.)
-                _draw_expression(
-                    canvas,
-                    cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
-                    fw=self.fw, fh=self.fh,
-                    emotion=emotion, t=t, char_idx=char_idx,
-                )
-                # Eye blink
-                blink_a = _blink_alpha(t, char_idx)
-                if blink_a > 0.04:
-                    _draw_eye_blink(
-                        canvas,
-                        cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
-                        fw=self.fw, fh=self.fh,
-                        alpha=blink_a,
-                    )
-                # Gaze toward speaker
-                _draw_gaze_toward_speaker(
-                    canvas,
-                    cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
-                    fw=self.fw, fh=self.fh,
-                    listener_idx=char_idx, t=t,
-                )
 
         # ── Name tags ─────────────────────────────────────────────────────────
         for char_idx in (listener_idx, speaker_idx):
@@ -1612,26 +1612,7 @@ class SingleSceneComposer:
             frame_rgba.paste(listen_crop, (nx1, ny1), listen_crop)
             frame = frame_rgba.convert("RGB")
 
-            # ── Expressions, blink, gaze on listener ──────────────────────────
-            frame_rgba2 = frame.convert("RGBA")
-            adj_cx = l_cx + shift_x
-            adj_cy = l_cy + shift_y
-            _draw_expression(
-                frame_rgba2, cx=adj_cx, cy=adj_cy,
-                fw=l_fw, fh=l_fh, emotion=emotion, t=t, char_idx=listener_idx,
-            )
-            blink_a = _blink_alpha(t, listener_idx)
-            if blink_a > 0.04:
-                _draw_eye_blink(
-                    frame_rgba2, cx=adj_cx, cy=adj_cy,
-                    fw=l_fw, fh=l_fh, alpha=blink_a,
-                )
-            _draw_gaze_toward_speaker(
-                frame_rgba2, cx=adj_cx, cy=adj_cy,
-                fw=l_fw, fh=l_fh, listener_idx=listener_idx, t=t,
-            )
-            frame = frame_rgba2.convert("RGB")
-
+            # No overlays on real faces — head nod alone conveys listening
             full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
             full.paste(frame, (0, 0))
             full.paste(subtitle, (0, self.char_h))
