@@ -43,6 +43,15 @@ import tempfile
 import textwrap
 from typing import Optional
 
+# ── NCCL compatibility shim ───────────────────────────────────────────────────
+# Must be set BEFORE torch is imported anywhere in this process.
+# Prevents "ncclCommWindowDeregister: undefined symbol" on hosts where
+# the system NCCL (2.18-) is older than what PyTorch (2.4+) was compiled against.
+# These flags disable peer-to-peer and InfiniBand NCCL transports; shared-memory
+# and socket transports remain active — fine for single-GPU inference.
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_IB_DISABLE",  "1")
+
 from PIL import Image
 
 
@@ -219,6 +228,13 @@ def _run_cli(
     if root not in env.get("PYTHONPATH", ""):
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
 
+    # Disable NCCL peer-to-peer and InfiniBand paths to avoid
+    # "ncclCommWindowDeregister: undefined symbol" on systems where the
+    # PyTorch NCCL version mismatches the system NCCL library.
+    env.setdefault("NCCL_P2P_DISABLE",  "1")
+    env.setdefault("NCCL_IB_DISABLE",   "1")
+    env.setdefault("NCCL_SHM_DISABLE",  "0")   # keep shared-mem transport
+
     result = subprocess.run(cmd, cwd=root, env=env)
 
     # Clean up temp config
@@ -349,6 +365,12 @@ def _run_api(
     In-process inference via the Open-Sora registry API.
     Less reliable than CLI but avoids subprocess overhead.
     """
+    # Set NCCL env vars BEFORE importing torch to prevent the
+    # "ncclCommWindowDeregister: undefined symbol" error caused by
+    # PyTorch being compiled against a newer NCCL than the system provides.
+    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+    os.environ.setdefault("NCCL_IB_DISABLE",  "1")
+
     import torch, numpy as np  # noqa: E401
 
     pipe = _get_pipeline_api(opensora_dir=opensora_dir)
