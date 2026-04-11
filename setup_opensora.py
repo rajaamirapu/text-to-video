@@ -83,19 +83,40 @@ def check_requirements():
     if (major, minor) < (3, 10):
         sys.exit("[Error] Python 3.10+ required.")
 
-    try:
-        import torch
-        print(f"  PyTorch: {torch.__version__}")
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                p    = torch.cuda.get_device_properties(i)
-                vram = p.total_memory / 1024**3
-                flag = "✓" if vram >= MIN_VRAM_GB else f"⚠ ({MIN_VRAM_GB} GB recommended)"
-                print(f"  GPU {i}  : {p.name}  {vram:.1f} GB  {flag}")
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import torch; "
+         "print(torch.__version__); "
+         "import json, torch; "
+         "gpus=[{'name':torch.cuda.get_device_name(i),"
+         "'vram':torch.cuda.get_device_properties(i).total_memory/1024**3}"
+         " for i in range(torch.cuda.device_count())];"
+         "print(json.dumps(gpus))"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        lines = result.stdout.strip().splitlines()
+        print(f"  PyTorch: {lines[0]}")
+        try:
+            import json
+            gpus = json.loads(lines[1]) if len(lines) > 1 else []
+            if gpus:
+                for i, g in enumerate(gpus):
+                    flag = "✓" if g["vram"] >= MIN_VRAM_GB else f"⚠ ({MIN_VRAM_GB} GB recommended)"
+                    print(f"  GPU {i}  : {g['name']}  {g['vram']:.1f} GB  {flag}")
+            else:
+                print("  CUDA   : ✗ no GPU detected — inference will be extremely slow on CPU")
+        except Exception:
+            pass
+    else:
+        stderr = result.stderr
+        if "ncclComm" in stderr or "undefined symbol" in stderr:
+            print(
+                "  PyTorch: ⚠ NCCL/CUDA symbol mismatch (ncclCommWindowDeregister).\n"
+                "           install_dependencies() will reinstall PyTorch 2.2.2+cu121."
+            )
         else:
-            print("  CUDA   : ✗ not available — inference will be extremely slow on CPU")
-    except ImportError:
-        print("  PyTorch: not found — will install")
+            print("  PyTorch: not installed or broken — will install.")
 
     rc = subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode
     print(f"  ffmpeg : {'✓' if rc == 0 else '✗ missing — please install ffmpeg'}")
@@ -130,21 +151,73 @@ def clone_or_update(opensora_dir: str):
 
 # ── Step 3: install dependencies ──────────────────────────────────────────────
 
+def _torch_loads_cleanly() -> bool:
+    """
+    Return True only if PyTorch imports without NCCL / CUDA symbol errors.
+    A broken torch (e.g. compiled against NCCL 2.19+ on a system with NCCL
+    2.18) raises an ImportError even though the package is 'installed'.
+    """
+    env = os.environ.copy()
+    # Disable NCCL peer-to-peer paths during the check to avoid false negatives
+    env["NCCL_P2P_DISABLE"] = "1"
+    env["NCCL_IB_DISABLE"]  = "1"
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import torch; assert torch.cuda.is_available(), 'no cuda'; "
+         "print(torch.__version__)"],
+        capture_output=True, text=True, env=env,
+    )
+    if result.returncode == 0:
+        ver = result.stdout.strip()
+        print(f"  PyTorch: {ver} (loads OK)")
+        return True
+
+    stderr = result.stderr
+    if "ncclComm" in stderr or "undefined symbol" in stderr or "libtorch_cuda" in stderr:
+        print("  PyTorch: NCCL/CUDA symbol mismatch detected — will reinstall.")
+    elif "no cuda" in stderr:
+        print("  PyTorch: installed but CUDA unavailable — will reinstall with cu121.")
+    else:
+        print(f"  PyTorch: import failed:\n    {stderr[:300]}")
+    return False
+
+
 def install_dependencies(opensora_dir: str):
     banner("Installing Python dependencies")
 
-    # PyTorch (CUDA 12.1)
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            raise ImportError("no cuda")
-        print(f"  PyTorch {torch.__version__} with CUDA already installed — skipping.")
-    except ImportError:
-        print("  Installing PyTorch 2.2 + CUDA 12.1 …")
+    # ── PyTorch 2.2.2 + CUDA 12.1 ────────────────────────────────────────────
+    # We pin to 2.2.2+cu121 because:
+    #   • It ships with NCCL 2.18.x — compatible with CUDA 12.0–12.3 on most
+    #     cloud platforms (Lightning AI, RunPod, vast.ai, Lambda …)
+    #   • Newer PyTorch (2.4+) links against NCCL 2.19+ which requires a
+    #     newer system NCCL and causes "undefined symbol: ncclCommWindowDeregister"
+    TORCH_VERSION    = "2.2.2"
+    TORCH_INDEX_URL  = "https://download.pytorch.org/whl/cu121"
+
+    if _torch_loads_cleanly():
+        # Verify the version is in the safe range
+        result = subprocess.run(
+            [sys.executable, "-c", "import torch; print(torch.__version__)"],
+            capture_output=True, text=True,
+        )
+        installed = result.stdout.strip()
+        major, minor = (int(x) for x in installed.split(".")[:2])
+        if major > 2 or (major == 2 and minor > 3):
+            print(f"  PyTorch {installed} is too new (NCCL 2.19+ risk) — downgrading to 2.2.2")
+        else:
+            print(f"  PyTorch {installed} is compatible — skipping reinstall.")
+            # Fall through to other deps
+            goto_deps = True
+    else:
+        goto_deps = False
+
+    if not goto_deps:
+        print(f"  Installing PyTorch {TORCH_VERSION} + CUDA 12.1 …")
         run([
-            sys.executable, "-m", "pip", "install",
-            "torch==2.2.2", "torchvision==0.17.2",
-            "--index-url", "https://download.pytorch.org/whl/cu121",
+            sys.executable, "-m", "pip", "install", "--upgrade",
+            f"torch=={TORCH_VERSION}",
+            "torchvision==0.17.2",
+            "--index-url", TORCH_INDEX_URL,
         ])
 
     # Core Open-Sora requirements
