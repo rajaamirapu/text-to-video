@@ -555,44 +555,74 @@ def _sway_offset(
 
 def _nod_curve(p: float) -> float:
     """
-    Asymmetric nod shape: slow lean-down (0→0.6), quick snap-up (0.6→1.0).
-    Maps normalised cycle phase p ∈ [0, 1] → displacement ∈ [-1, 0].
-    Negative = downward (chin toward chest, natural listening nod).
+    Asymmetric nod shape mapped to normalised cycle phase p ∈ [0, 1].
+    Returns value ∈ [-1, 0]:  -1 = chin fully down,  0 = head upright.
+
+    Timing breakdown:
+      0.00 – 0.15  pause at neutral   (head resting before nod)
+      0.15 – 0.45  quick chin-down    (fast lean, the "nod" motion)
+      0.45 – 0.60  hold at bottom     (brief pause at lowest point)
+      0.60 – 0.80  smooth return up   (ease-out back to neutral)
+      0.80 – 1.00  pause at neutral   (rest before next nod)
     """
-    if p < 0.6:
-        # smooth ease-in downward: sine easing
-        return -math.sin(math.pi * p / 1.2)
-    else:
-        # quick spring back
-        q = (p - 0.6) / 0.4
-        return -(1.0 - q) * math.sin(math.pi * 0.5)
+    if p < 0.15:
+        return 0.0                                        # rest
+    if p < 0.45:
+        q = (p - 0.15) / 0.30
+        return -math.sin(q * math.pi * 0.5)              # ease-in down
+    if p < 0.60:
+        return -1.0                                       # hold at bottom
+    if p < 0.80:
+        q = (p - 0.60) / 0.20
+        return -(1.0 - math.sin(q * math.pi * 0.5))      # ease-out up
+    return 0.0                                            # rest
 
 
-def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> int:
+def _rotate_face(img: Image.Image, angle_deg: float) -> Image.Image:
     """
-    Natural-looking head nod for the listener.
+    Rotate *img* around its chin pivot (80 % down from top) to simulate a nod.
+    Positive angle = tilt backward; negative = chin forward (natural nod).
+    Uses BICUBIC resampling and keeps the original canvas size.
+    """
+    if abs(angle_deg) < 0.05:
+        return img
+    w, h   = img.size
+    pivot  = (w // 2, int(h * 0.80))          # neck / chin area
+    return img.rotate(
+        angle_deg,
+        resample  = Image.BICUBIC,
+        center    = pivot,
+        expand    = False,
+        fillcolor = None,
+    )
 
-    Uses an asymmetric curve: slow lean-down, quick spring-back — exactly
-    how real nods look. Amplitude and rate scale with emotion.
-    A second harmonic adds slight irregularity so it never feels looped.
+
+def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> float:
     """
-    phase  = _CHAR_PHASE[char_idx % 2]
-    irr    = 0.12 * math.sin(2 * math.pi * 0.07 * t + phase * 2.3)   # irregularity
+    Returns the head-rotation angle in degrees for the listener at time *t*.
+    Negative = chin tilting forward (the visible nod motion).
+
+    Uses a discrete nod pulse (pause → fast down → hold → smooth return → pause)
+    so each nod is clearly visible rather than a continuous sine bob.
+    A small irregularity offset prevents the loop from feeling mechanical.
+    """
+    phase = _CHAR_PHASE[char_idx % 2]
+    # Small random-feeling irregularity: ±10 % amplitude variation
+    irr   = 1.0 + 0.10 * math.sin(2 * math.pi * 0.09 * t + phase * 1.7)
 
     if emotion == "excited":
-        freq, amp = 1.00, 18          # fast, enthusiastic
+        freq, amp = 1.10, 7.0     # fast, bigger tilt
     elif emotion == "surprised":
-        freq, amp = 0.90, 14
+        freq, amp = 1.00, 5.5
     elif emotion == "thoughtful":
-        freq, amp = 0.45, 16          # deliberate but visible
+        freq, amp = 0.55, 6.0     # slower, deliberate
     elif emotion == "happy":
-        freq, amp = 0.75, 14
+        freq, amp = 0.85, 5.5
     else:
-        freq, amp = 0.55, 12          # calm, attentive — noticeably faster
+        freq, amp = 0.70, 5.0     # neutral — clear, not too fast
 
-    p  = (t * freq + phase / (2 * math.pi)) % 1.0
-    dy = _nod_curve(p) * amp * (1.0 + irr)
-    return int(dy)
+    p = (t * freq + phase / (2 * math.pi)) % 1.0
+    return _nod_curve(p) * amp * irr
 
 
 def _blink_alpha(t: float, char_idx: int) -> float:
@@ -1216,14 +1246,15 @@ class VideoComposer:
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
-                # Listener: head nod + breathing sway only — no overlays on real faces
-                nod_dy           = _listener_nod(t, char_idx, emotion=emotion)
+                # Listener: rotation-based nod (chin pivot) + gentle sway
+                nod_angle        = _listener_nod(t, char_idx, emotion=emotion)
                 l_face, ldx, ldy = _animate_face(
                     listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
                 )
+                l_face = _rotate_face(l_face, nod_angle)
                 ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
                 _blend_panel_face(canvas, l_face, px0,
-                                  cy + ldy2 + nod_dy,
+                                  cy + ldy2,
                                   l_face.width, l_face.height)
 
         # ── Name tags ─────────────────────────────────────────────────────────
@@ -1588,30 +1619,23 @@ class SingleSceneComposer:
             # ── Speaker: Wav2Lip animated lip region ──────────────────────────
             frame = _blend_face_into_scene(self.scene, spk_frame, pbbox)
 
-            # ── Listener: nod / sway by re-blending shifted crop ──────────────
-            nod_dy       = _listener_nod(t, listener_idx, emotion=emotion)
-            sdx, sdy     = _sway_offset(t, listener_idx, is_speaking=False, emotion=emotion)
-            shift_x      = int(sdx)
-            shift_y      = int(sdy + nod_dy)
-            img_w, img_h = frame.size
-            nx1 = max(0, min(lx1 + shift_x, img_w - 1))
-            ny1 = max(0, min(ly1 + shift_y, img_h - 1))
-            nx2 = max(nx1 + 1, min(lx2 + shift_x, img_w))
-            ny2 = max(ny1 + 1, min(ly2 + shift_y, img_h))
-
+            # ── Listener: rotation nod at same position (no spatial shift) ──────
+            nod_angle = _listener_nod(t, listener_idx, emotion=emotion)
+            # Extract face crop from original undistorted scene
             listen_crop = self.scene.crop((lx1, ly1, lx2, ly2)).convert("RGBA")
+            # Rotate around chin pivot — this is the actual nod motion
+            listen_crop = _rotate_face(listen_crop, nod_angle)
+            # Blend back at the SAME position (no spatial drift, no seams)
             frame_rgba  = frame.convert("RGBA")
-            mask_img    = Image.new("L", listen_crop.size, 0)
-            mask_d      = ImageDraw.Draw(mask_img)
             mw, mh      = listen_crop.size
-            margin      = int(min(mw, mh) * 0.12)
+            margin      = int(min(mw, mh) * 0.10)
+            mask_img    = Image.new("L", (mw, mh), 0)
+            mask_d      = ImageDraw.Draw(mask_img)
             mask_d.ellipse([margin, margin, mw - margin, mh - margin], fill=240)
-            mask_img    = mask_img.filter(ImageFilter.GaussianBlur(int(min(mw, mh) * 0.08)))
+            mask_img    = mask_img.filter(ImageFilter.GaussianBlur(int(min(mw, mh) * 0.12)))
             listen_crop.putalpha(mask_img)
-            frame_rgba.paste(listen_crop, (nx1, ny1), listen_crop)
+            frame_rgba.paste(listen_crop, (lx1, ly1), listen_crop)
             frame = frame_rgba.convert("RGB")
-
-            # No overlays on real faces — head nod alone conveys listening
             full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
             full.paste(frame, (0, 0))
             full.paste(subtitle, (0, self.char_h))
