@@ -553,6 +553,79 @@ def _sway_offset(
     return int(dx), int(dy)
 
 
+def _listening_brightness(img: Image.Image, t: float, char_idx: int,
+                          max_boost: float = 0.04) -> Image.Image:
+    """
+    Gently pulse the brightness of the listener's face image — a 3–4 %
+    increase/decrease following a slow heartbeat rhythm.  Imperceptible as
+    animation but removes the 'frozen statue' feeling.
+
+    Works on any Image mode; returns an RGB image.
+    """
+    phase  = _CHAR_PHASE[char_idx % 2]
+    # Slow dual-frequency heartbeat: 0.9 Hz carrier, 0.13 Hz envelope
+    pulse  = (math.sin(2 * math.pi * 0.9 * t + phase) * 0.6 +
+               math.sin(2 * math.pi * 0.13 * t + phase * 0.7) * 0.4)
+    boost  = 1.0 + max_boost * pulse          # [0.96 … 1.04]
+    arr    = np.clip(np.array(img.convert("RGB"), dtype=np.float32) * boost,
+                     0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def _draw_attention_glow(canvas: Image.Image,
+                         cx: int, cy: int,
+                         fw: int, fh: int,
+                         t: float,
+                         color: tuple = (80, 160, 255),
+                         max_alpha: int = 38) -> None:
+    """
+    Draw a soft colored halo AROUND the listener's head — in the background
+    space, not touching face pixels.  The glow pulses slowly and never covers
+    the actual face.
+
+    The halo is an outer ellipse minus an inner ellipse (donut shape) so
+    it only lights up the area around the head silhouette.
+    """
+    phase     = _CHAR_PHASE[0]   # constant slow pulse
+    pulse     = 0.5 + 0.5 * math.sin(2 * math.pi * 0.30 * t + phase)
+    alpha     = int(max_alpha * pulse)
+    if alpha < 2:
+        return
+
+    r, g, b   = color
+    outer_rx  = int(fw * 0.72)
+    outer_ry  = int(fh * 0.72)
+    inner_rx  = int(fw * 0.52)   # inner edge sits just outside the face
+    inner_ry  = int(fh * 0.52)
+
+    gl = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(gl)
+    # Outer ellipse (solid fill)
+    gd.ellipse([cx - outer_rx, cy - outer_ry,
+                cx + outer_rx, cy + outer_ry],
+               fill=(r, g, b, alpha))
+    # Inner ellipse (punch hole — transparent)
+    gd.ellipse([cx - inner_rx, cy - inner_ry,
+                cx + inner_rx, cy + inner_ry],
+               fill=(0, 0, 0, 0))
+    # Blur for soft glow feel
+    gl = gl.filter(ImageFilter.GaussianBlur(int(min(fw, fh) * 0.12)))
+    canvas.alpha_composite(gl)
+
+
+def _draw_scene_attention_glow(frame: Image.Image,
+                                cx: int, cy: int,
+                                fw: int, fh: int,
+                                t: float,
+                                color: tuple = (80, 160, 255)) -> Image.Image:
+    """
+    Same halo but composited on a plain RGB frame (for SingleSceneComposer).
+    """
+    canvas = frame.convert("RGBA")
+    _draw_attention_glow(canvas, cx, cy, fw, fh, t, color)
+    return canvas.convert("RGB")
+
+
 def _nod_curve(p: float) -> float:
     """
     Asymmetric nod shape mapped to normalised cycle phase p ∈ [0, 1].
@@ -1304,16 +1377,20 @@ class VideoComposer:
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
-                # Listener: move the whole portrait up/down in the panel.
-                # Shifting cy is clean — no cropping or masking, no ghost image.
+                # Listener: nod (y-position shift) + brightness pulse + glow
                 nod_dy           = _listener_nod(t, char_idx, emotion=emotion)
                 l_face, ldx, ldy = _animate_face(
                     listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
                 )
                 ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
-                _blend_panel_face(canvas, l_face, px0,
-                                  cy + ldy2 + nod_dy,
+                # Subtle brightness pulse — removes the "frozen" look
+                l_face = _listening_brightness(l_face, t, char_idx)
+                face_cy = cy + ldy2 + nod_dy
+                _blend_panel_face(canvas, l_face, px0, face_cy,
                                   l_face.width, l_face.height)
+                # Soft attention glow around the listener's head
+                _draw_attention_glow(canvas, cx=cx + ldx2, cy=face_cy,
+                                     fw=self.fw, fh=self.fh, t=t)
 
         # ── Name tags ─────────────────────────────────────────────────────────
         for char_idx in (listener_idx, speaker_idx):
@@ -1655,9 +1732,20 @@ class SingleSceneComposer:
             except Exception:
                 audio_ok = False
 
-        duration = max(audio_dur, 0.5)
-        pbbox    = self._padded[speaker_idx]
-        subtitle = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
+        duration     = max(audio_dur, 0.5)
+        pbbox        = self._padded[speaker_idx]
+        listener_idx = 1 - speaker_idx
+        subtitle     = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
+
+        # Listener face centre + approximate size for glow positioning
+        lx1, ly1, lx2, ly2 = self._padded[listener_idx]
+        l_cx  = (lx1 + lx2) // 2
+        l_cy  = (ly1 + ly2) // 2
+        l_fw  = lx2 - lx1
+        l_fh  = ly2 - ly1
+        # Per-character glow colour (warm amber for char 0, cool blue for char 1)
+        GLOW_COLORS = [(255, 200, 100), (100, 180, 255)]
+        glow_color  = GLOW_COLORS[listener_idx % 2]
 
         print(f"  [Scene] speaker={speaker_name}  bbox={pbbox}")
 
@@ -1668,10 +1756,13 @@ class SingleSceneComposer:
             # ── Speaker: Wav2Lip animated lip region ──────────────────────────
             frame = _blend_face_into_scene(self.scene, spk_frame, pbbox)
 
-            # Listener stays still in the real photo — only speaker lips animate.
-            # Animating a cropped face region on a real photo always creates ghost
-            # artefacts (the original face shows underneath). This is the natural
-            # appearance of a listening person in a real conversation.
+            # ── Listener: attention glow around the head (no pixel manipulation)
+            # A soft pulsing halo in the background around the listener's head
+            # indicates engagement without distorting the real photo.
+            frame = _draw_scene_attention_glow(
+                frame, l_cx, l_cy, l_fw, l_fh, t, color=glow_color
+            )
+
             full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
             full.paste(frame, (0, 0))
             full.paste(subtitle, (0, self.char_h))

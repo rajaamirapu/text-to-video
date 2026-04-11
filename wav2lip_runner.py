@@ -64,31 +64,83 @@ def check_or_abort():
 
 # ── core inference ────────────────────────────────────────────────────────────
 
+def _normalize_audio(data: "np.ndarray", target_peak: float = 0.92) -> "np.ndarray":
+    """
+    Peak-normalize float32 audio so the loudest sample reaches target_peak.
+    This ensures Wav2Lip's mel-spectrogram covers the full dynamic range,
+    which dramatically improves lip-sync accuracy on quiet TTS output.
+    Clips at ±1.0 to prevent PCM overflow.
+    """
+    import numpy as np
+    peak = np.abs(data).max()
+    if peak < 1e-6:          # silence — return as-is
+        return data
+    data = data * (target_peak / peak)
+    return np.clip(data, -1.0, 1.0)
+
+
 def _ensure_wav_16k(audio_path: str, wav2lip_tmp_dir: str) -> str:
     """
     Convert audio to 16 kHz mono WAV — the exact format Wav2Lip expects.
-    If the input is already a .wav this still re-encodes to guarantee 16kHz mono.
-    Returns the path to the converted WAV.
+    Also peak-normalises the audio to 0.92 FS so the mel-spectrogram has
+    full dynamic range — quiet TTS signals would otherwise produce
+    near-flat spectrograms that cause static / poor lip-sync.
+
+    Pipeline:
+      1. ffmpeg: resample + mono + loudnorm (EBU R128 integrated loudness -16 LUFS)
+      2. soundfile fallback: resample + mono + numpy peak normalise
+      3. Last resort: return original path unchanged
+
+    Returns the path to the processed WAV.
     """
     out_wav = os.path.join(wav2lip_tmp_dir, "input_audio_16k.wav")
+
+    # ── Attempt 1: ffmpeg with loudnorm filter ────────────────────────────────
+    # loudnorm: integrated=-16 LUFS, true_peak=-1.5 dBTP, LRA=11
+    # This brings quiet voices up and prevents clipping on loud ones.
     cmd = [
         "ffmpeg", "-y", "-i", audio_path,
-        "-ar", "16000",      # 16 kHz sample rate (what Wav2Lip uses for mel)
-        "-ac", "1",          # mono
-        "-c:a", "pcm_s16le", # 16-bit PCM WAV
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-ar", "16000",       # 16 kHz sample rate
+        "-ac", "1",           # mono
+        "-c:a", "pcm_s16le",  # 16-bit PCM WAV
         out_wav,
     ]
     result = subprocess.run(cmd, capture_output=True, timeout=60)
     if result.returncode == 0 and os.path.isfile(out_wav) and os.path.getsize(out_wav) > 0:
+        print("  [Wav2Lip] Audio normalised via ffmpeg loudnorm (-16 LUFS)")
         return out_wav
-    # ffmpeg failed — try with soundfile as fallback
+
+    # ── Attempt 2: ffmpeg without loudnorm (basic resample) ──────────────────
+    cmd_basic = [
+        "ffmpeg", "-y", "-i", audio_path,
+        "-ar", "16000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        out_wav,
+    ]
+    result2 = subprocess.run(cmd_basic, capture_output=True, timeout=60)
+    if result2.returncode == 0 and os.path.isfile(out_wav) and os.path.getsize(out_wav) > 0:
+        # Apply numpy peak normalisation post-hoc
+        try:
+            import soundfile as sf
+            import numpy as np
+            data, sr = sf.read(out_wav)
+            data = _normalize_audio(data.astype(np.float32))
+            sf.write(out_wav, data, sr, subtype="PCM_16")
+            print("  [Wav2Lip] Audio peak-normalised to 0.92 FS (numpy)")
+        except Exception:
+            pass   # normalisation failed — still better than nothing
+        return out_wav
+
+    # ── Attempt 3: soundfile fallback ─────────────────────────────────────────
     try:
         import soundfile as sf
         import numpy as np
         data, sr = sf.read(audio_path)
         if data.ndim > 1:
             data = data.mean(axis=1)   # stereo → mono
-        # simple resample via numpy linspace if not already 16k
+        # Resample to 16 kHz if needed
         if sr != 16000:
             n_out = int(len(data) * 16000 / sr)
             data  = np.interp(
@@ -96,33 +148,56 @@ def _ensure_wav_16k(audio_path: str, wav2lip_tmp_dir: str) -> str:
                 np.arange(len(data)),
                 data,
             ).astype(np.float32)
+        # Peak normalise
+        data = _normalize_audio(data.astype(np.float32))
         sf.write(out_wav, data, 16000, subtype="PCM_16")
+        print("  [Wav2Lip] Audio converted + peak-normalised via soundfile")
         return out_wav
     except Exception:
         pass
+
     # If all else fails return original path and let Wav2Lip try
+    print("  [Wav2Lip] WARNING: audio preprocessing failed, using original file")
     return audio_path
 
 
 def _ensure_face_min_size(face_image_path: str, wav2lip_tmp_dir: str,
                           min_size: int = 256) -> str:
     """
-    Wav2Lip's S3FD face detector needs the face to be at least ~96 px wide
-    inside a ~256 px image. Return an upscaled copy if the source is tiny.
+    Wav2Lip's S3FD face detector needs the face to be at least ~96 px wide.
+    Upscale to min_size if smaller.  Also sharpen the image slightly so the
+    detector finds the face more reliably on synthetic/generated portraits.
     """
     try:
-        from PIL import Image as _Img
+        from PIL import Image as _Img, ImageFilter as _IF, ImageEnhance as _IE
         img = _Img.open(face_image_path).convert("RGB")
         w, h = img.size
+
+        # ── Ensure minimum resolution ─────────────────────────────────────────
         if w < min_size or h < min_size:
             scale  = max(min_size / w, min_size / h)
             new_w  = max(min_size, int(w * scale))
             new_h  = max(min_size, int(h * scale))
             img    = img.resize((new_w, new_h), _Img.LANCZOS)
-            out    = os.path.join(wav2lip_tmp_dir, "face_upscaled.png")
-            img.save(out)
             print(f"  [Wav2Lip] Face upscaled {w}×{h} → {new_w}×{new_h}")
-            return out
+            w, h = new_w, new_h
+
+        # ── Target: 480 px on the short side for crisp lip region ─────────────
+        TARGET = 480
+        if min(w, h) < TARGET:
+            scale  = TARGET / min(w, h)
+            new_w  = int(w * scale)
+            new_h  = int(h * scale)
+            img    = img.resize((new_w, new_h), _Img.LANCZOS)
+            print(f"  [Wav2Lip] Face upscaled to {new_w}×{new_h} for better sync")
+            w, h = new_w, new_h
+
+        # ── Mild sharpening — helps detector on soft/blurry portraits ─────────
+        img = _IE.Sharpness(img).enhance(1.4)
+
+        out = os.path.join(wav2lip_tmp_dir, "face_prepared.png")
+        img.save(out, "PNG")
+        return out
     except Exception:
         pass
     return face_image_path
@@ -136,9 +211,9 @@ def run_wav2lip(
     resize_factor: int    = 1,
     fps: int              = 25,
     pad_top: int          = 0,
-    pad_bottom: int       = 10,
-    pad_left: int         = 0,
-    pad_right: int        = 0,
+    pad_bottom: int       = 18,   # more chin room → mouth fully visible
+    pad_left: int         = 6,    # small horizontal padding → stable detection
+    pad_right: int        = 6,
     nosmooth: bool        = False,
 ) -> str:
     """
@@ -152,8 +227,8 @@ def run_wav2lip(
     use_gan         : True → wav2lip_gan.pth (sharper), False → wav2lip.pth (faster)
     resize_factor   : downsample by this factor (1 = full res)
     fps             : output video frame rate
-    pad_*           : face bounding-box padding (pixels); increase pad_bottom if
-                      mouth is clipped at the chin
+    pad_bottom      : chin padding in pixels — increase if mouth is clipped (default 18)
+    pad_left/right  : horizontal padding — helps on narrow face crops (default 6)
     nosmooth        : disable temporal smoothing (faster but less smooth)
 
     Returns
