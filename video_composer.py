@@ -573,6 +573,95 @@ def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> int:
         return int(4 * math.sin(2 * math.pi * 0.25 * t + phase))
 
 
+def _blink_alpha(t: float, char_idx: int) -> float:
+    """
+    Returns 0.0 (eyes open) → 1.0 (eyes closed) following a realistic blink
+    pattern: ~4-second intervals, ~150 ms duration, fast-close / hold / fast-open.
+    Each character blinks independently (different period offsets).
+    """
+    period = 4.2 + char_idx * 1.3          # slightly different for each person
+    phase  = _CHAR_PHASE[char_idx % 2]
+    t_mod  = (t + phase * period / (2 * math.pi)) % period
+    dur    = 0.15                           # 150 ms total blink
+    if t_mod >= dur:
+        return 0.0
+    p = t_mod / dur
+    if p < 0.4:   return p / 0.4           # fast close
+    if p < 0.6:   return 1.0               # brief hold
+    return 1.0 - (p - 0.6) / 0.4          # fast open
+
+
+def _draw_eye_blink(
+    canvas: Image.Image,
+    cx: int, cy: int,
+    fw: int, fh: int,
+    alpha: float,
+) -> None:
+    """
+    Overlay a semi-transparent eyelid closure at the approximate eye positions.
+    Uses a skin-toned ellipse so the blink blends naturally with the portrait.
+    """
+    if alpha < 0.04:
+        return
+    eye_y   = cy - int(fh * 0.12)
+    eye_sep = int(fw * 0.20)
+    eye_rx  = int(fw * 0.11)
+    eye_ry  = int(fh * 0.065)
+    a       = int(255 * alpha)
+    skin    = (205, 170, 135)           # neutral mid-tone skin
+
+    bl = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    bd = ImageDraw.Draw(bl)
+    for side in (-1, 1):
+        ex = cx + side * eye_sep
+        bd.ellipse([ex - eye_rx, eye_y - eye_ry,
+                    ex + eye_rx, eye_y + eye_ry],
+                   fill=(*skin, a))
+    canvas.alpha_composite(bl)
+
+
+def _draw_gaze_toward_speaker(
+    canvas: Image.Image,
+    cx: int, cy: int,
+    fw: int, fh: int,
+    listener_idx: int,
+    t: float,
+) -> None:
+    """
+    Subtle dark iris shift to make the listener's eyes appear to look toward
+    the speaker (inward).  Left-panel listener (idx 0) looks right; right-panel
+    listener (idx 1) looks left.
+    """
+    eye_y   = cy - int(fh * 0.12)
+    eye_sep = int(fw * 0.20)
+    iris_r  = max(2, int(fw * 0.055))
+    # Gentle saccade: small slow drift toward center + tiny oscillation
+    phase   = _CHAR_PHASE[listener_idx % 2]
+    drift   = int(iris_r * 0.45) * (1 if listener_idx % 2 == 0 else -1)
+    jitter  = int(iris_r * 0.15 * math.sin(2 * math.pi * 0.18 * t + phase))
+    shift_x = drift + jitter
+
+    gl = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(gl)
+    for side in (-1, 1):
+        ex = cx + side * eye_sep + shift_x
+        # Iris
+        gd.ellipse([ex - iris_r, eye_y - iris_r,
+                    ex + iris_r, eye_y + iris_r],
+                   fill=(55, 80, 50, 200))
+        # Pupil
+        pr = max(1, int(iris_r * 0.55))
+        gd.ellipse([ex - pr, eye_y - pr,
+                    ex + pr, eye_y + pr],
+                   fill=(12, 8, 6, 220))
+        # Catchlight
+        cl = max(1, int(iris_r * 0.25))
+        gd.ellipse([ex - iris_r + cl, eye_y - iris_r + cl,
+                    ex - iris_r + cl * 3, eye_y - iris_r + cl * 3],
+                   fill=(255, 255, 255, 160))
+    canvas.alpha_composite(gl)
+
+
 def _animate_face(
     face_img: Image.Image,
     fw: int, fh: int,
@@ -989,6 +1078,22 @@ class VideoComposer:
                     fw=self.fw, fh=self.fh,
                     emotion=emotion, t=t, char_idx=char_idx,
                 )
+                # Eye blink
+                blink_a = _blink_alpha(t, char_idx)
+                if blink_a > 0.04:
+                    _draw_eye_blink(
+                        canvas,
+                        cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
+                        fw=self.fw, fh=self.fh,
+                        alpha=blink_a,
+                    )
+                # Gaze toward speaker
+                _draw_gaze_toward_speaker(
+                    canvas,
+                    cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
+                    fw=self.fw, fh=self.fh,
+                    listener_idx=char_idx, t=t,
+                )
 
         # ── Name tags ─────────────────────────────────────────────────────────
         for char_idx in (listener_idx, speaker_idx):
@@ -1335,13 +1440,79 @@ class SingleSceneComposer:
         emotion  = _detect_emotion(dialogue_text)
         subtitle = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
+        listener_idx  = 1 - speaker_idx
+        listener_pbbox = self._padded[listener_idx]
+        # Approximate face centre and size for overlay helpers
+        lx1, ly1, lx2, ly2 = listener_pbbox
+        l_fw = lx2 - lx1
+        l_fh = ly2 - ly1
+        l_cx = (lx1 + lx2) // 2
+        l_cy = (ly1 + ly2) // 2
+
         print(f"  [Scene] Emotion: {emotion!r}  speaker={speaker_name}  bbox={pbbox}")
 
         def make_frame(t: float) -> np.ndarray:
             safe_t    = max(0.0, min(t, wav2lip_dur - 1.0 / max(1, self.fps)))
             spk_frame = talking.get_frame(safe_t)
-            frame     = _blend_face_into_scene(self.scene, spk_frame, pbbox)
-            full      = Image.new("RGB", (self.width, self.height), (8, 8, 8))
+
+            # ── Speaker face animated by Wav2Lip ──────────────────────────────
+            frame = _blend_face_into_scene(self.scene, spk_frame, pbbox)
+
+            # ── Listener: apply subtle nod / sway by shifting crop region ────
+            nod_dy  = _listener_nod(t, listener_idx, emotion=emotion)
+            sdx, sdy = _sway_offset(t, listener_idx, is_speaking=False, emotion=emotion)
+            # Shift the listener crop region by the animation offsets
+            shift_x = int(sdx)
+            shift_y = int(sdy + nod_dy)
+            # Clamp shifted bbox to image bounds
+            img_w, img_h = frame.size
+            nx1 = max(0, min(lx1 + shift_x, img_w - 1))
+            ny1 = max(0, min(ly1 + shift_y, img_h - 1))
+            nx2 = max(nx1 + 1, min(lx2 + shift_x, img_w))
+            ny2 = max(ny1 + 1, min(ly2 + shift_y, img_h))
+
+            # Extract listener crop from original (un-shifted) scene
+            listen_crop = self.scene.crop((lx1, ly1, lx2, ly2)).convert("RGBA")
+            # Blend shifted listener crop back into the animated frame
+            frame_rgba  = frame.convert("RGBA")
+            # Soft elliptical mask for natural blend
+            mask_img = Image.new("L", listen_crop.size, 0)
+            mask_d   = ImageDraw.Draw(mask_img)
+            mw, mh   = listen_crop.size
+            margin   = int(min(mw, mh) * 0.12)
+            mask_d.ellipse([margin, margin, mw - margin, mh - margin], fill=240)
+            mask_img = mask_img.filter(ImageFilter.GaussianBlur(int(min(mw, mh) * 0.08)))
+            listen_crop.putalpha(mask_img)
+            frame_rgba.paste(listen_crop, (nx1, ny1), listen_crop)
+            frame = frame_rgba.convert("RGB")
+
+            # ── Expression / blink / gaze overlays on listener ────────────────
+            frame_rgba2 = frame.convert("RGBA")
+            adj_cx = l_cx + shift_x
+            adj_cy = l_cy + shift_y
+            _draw_expression(
+                frame_rgba2,
+                cx=adj_cx, cy=adj_cy,
+                fw=l_fw, fh=l_fh,
+                emotion=emotion, t=t, char_idx=listener_idx,
+            )
+            blink_a = _blink_alpha(t, listener_idx)
+            if blink_a > 0.04:
+                _draw_eye_blink(
+                    frame_rgba2,
+                    cx=adj_cx, cy=adj_cy,
+                    fw=l_fw, fh=l_fh,
+                    alpha=blink_a,
+                )
+            _draw_gaze_toward_speaker(
+                frame_rgba2,
+                cx=adj_cx, cy=adj_cy,
+                fw=l_fw, fh=l_fh,
+                listener_idx=listener_idx, t=t,
+            )
+            frame = frame_rgba2.convert("RGB")
+
+            full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
             full.paste(frame, (0, 0))
             full.paste(subtitle, (0, self.char_h))
             return np.asarray(full, dtype=np.uint8)
