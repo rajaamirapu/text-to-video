@@ -626,6 +626,178 @@ def _draw_scene_attention_glow(frame: Image.Image,
     return canvas.convert("RGB")
 
 
+def _draw_listening_hand(canvas: Image.Image,
+                          panel_x0: int, panel_w: int, char_h: int,
+                          t: float, char_idx: int,
+                          skin: tuple = (210, 170, 120)) -> None:
+    """
+    Draw a small "open-palm / raised hand" icon in the lower-outer corner of
+    the listener's panel to signal listening mode.
+
+    Visual design
+    ─────────────
+    •  Palm: filled rounded ellipse (skin tone)
+    •  4 fingers: slim rounded rectangles fanning slightly outward from palm top
+    •  Thumb: shorter angled rectangle on the side
+    •  Faint drop-shadow for depth
+    •  Whole icon scales in/out with a slow 0.28 Hz breath pulse
+    •  Icon sits in the bottom outer corner so it never overlaps the face
+
+    Parameters
+    ──────────
+    canvas   : RGBA image to draw onto
+    panel_x0 : left edge of this character's panel (px)
+    panel_w  : width of one panel (px)
+    char_h   : height of the character area (px)
+    t        : current time (seconds)
+    char_idx : 0 or 1 — used for phase offset so the two hands pulse independently
+    skin     : base skin RGB tuple
+    """
+    phase  = _CHAR_PHASE[char_idx % 2]
+    # Slow breath pulse 0.28 Hz: scale between 0.88 … 1.12
+    pulse  = 0.5 + 0.5 * math.sin(2 * math.pi * 0.28 * t + phase)
+    scale  = 0.88 + 0.24 * pulse            # 0.88 → 1.12
+
+    # ── size & position ───────────────────────────────────────────────────────
+    # Icon size is proportional to panel width (≈ 11 %)
+    base_size = max(28, int(panel_w * 0.11))
+    sz  = int(base_size * scale)            # scaled palm half-size (radius)
+    hw  = max(1, int(sz * 0.55))            # palm half-width
+    hh  = max(1, int(sz * 0.65))            # palm half-height
+
+    # Position: bottom-outer corner, slight inset
+    margin = max(8, int(panel_w * 0.06))
+    # Outer edge = right side for char 0 (left panel), left side for char 1
+    if char_idx == 0:
+        cx = panel_x0 + panel_w - margin - hw  # right side of left panel
+    else:
+        cx = panel_x0 + margin + hw             # left side of right panel
+    cy = char_h - margin - hh - int(sz * 1.6)  # above the name tag area
+
+    # ── helper: draw rounded rect on a draw object ────────────────────────────
+    def _rrect(draw_obj, x0, y0, x1, y1, r, fill):
+        r = max(1, min(r, (x1 - x0) // 2, (y1 - y0) // 2))
+        draw_obj.rounded_rectangle([x0, y0, x1, y1], radius=r, fill=fill)
+
+    # ── alpha (opacity) follows pulse, fully visible at peak ──────────────────
+    alpha_base = 200
+    alpha = max(60, int(alpha_base * (0.6 + 0.4 * pulse)))
+
+    # ── draw shadow ───────────────────────────────────────────────────────────
+    shadow_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow_layer)
+    shx, shy = 2, 3
+    sd.ellipse([cx - hw + shx, cy - hh + shy,
+                cx + hw + shx, cy + hh + shy],
+               fill=(0, 0, 0, 60))
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(3))
+    canvas.alpha_composite(shadow_layer)
+
+    # ── draw on a fresh RGBA layer so we can alpha-composite cleanly ──────────
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    d     = ImageDraw.Draw(layer)
+
+    sr, sg, sb = skin
+    # Slightly darker shading for side of palm
+    shade = (max(0, sr - 25), max(0, sg - 20), max(0, sb - 15), alpha)
+    base_fill = (sr, sg, sb, alpha)
+
+    # ── Palm ellipse ──────────────────────────────────────────────────────────
+    d.ellipse([cx - hw, cy - hh, cx + hw, cy + hh], fill=base_fill)
+
+    # ── Fingers (4): fan out from top of palm ─────────────────────────────────
+    # Finger widths/heights relative to sz
+    fw_f = max(3, int(sz * 0.18))  # finger width
+    fh_f = max(6, int(sz * 0.85))  # finger height (tall)
+
+    # Each finger has (dx_from_cx, height_multiplier, angle_offset_pixels)
+    fingers = [
+        (-int(sz * 0.36), 0.75, -int(sz * 0.10)),   # index (leftmost)
+        (-int(sz * 0.12), 1.00,  0               ),   # middle (tallest)
+        ( int(sz * 0.12), 0.95,  0               ),   # ring
+        ( int(sz * 0.36), 0.70,  int(sz * 0.08) ),   # pinky (rightmost)
+    ]
+    for (fdx, fheight_mul, fan) in fingers:
+        fx = cx + fdx
+        fh_this = max(4, int(fh_f * fheight_mul))
+        # Finger base sits at top of palm; fan shifts the bottom slightly
+        fy_top    = cy - hh - fh_this + max(1, int(sz * 0.20))
+        fy_bottom = cy - hh + max(1, int(sz * 0.20))
+        _rrect(d,
+               fx - fw_f // 2 + fan,
+               fy_top,
+               fx + fw_f // 2 + fan,
+               fy_bottom,
+               fw_f // 2,
+               base_fill)
+
+    # ── Thumb: angled, on the outer edge of the palm ─────────────────────────
+    tw = max(3, int(sz * 0.19))
+    th = max(5, int(sz * 0.55))
+    # Thumb points diagonally outward from the palm side
+    if char_idx == 0:
+        tx = cx + hw - tw // 2          # right side (away from panel centre)
+        t_angle_x = int(sz * 0.18)
+    else:
+        tx = cx - hw + tw // 2          # left side
+        t_angle_x = -int(sz * 0.18)
+    ty_top    = cy - int(sz * 0.35)
+    ty_bottom = cy + int(sz * 0.30)
+    _rrect(d,
+           tx - tw // 2 + t_angle_x,
+           ty_top,
+           tx + tw // 2 + t_angle_x,
+           ty_bottom,
+           tw // 2,
+           shade)
+
+    # ── Knuckle line: subtle arc across the top of the palm ──────────────────
+    knuckle_alpha = max(20, int(80 * pulse))
+    d.arc([cx - hw + 2, cy - hh + 2, cx + hw - 2, cy + int(sz * 0.10)],
+          start=200, end=340,
+          fill=(max(0, sr - 40), max(0, sg - 35), max(0, sb - 25), knuckle_alpha),
+          width=max(1, int(sz * 0.06)))
+
+    canvas.alpha_composite(layer)
+
+
+def _draw_scene_listening_hand(frame: "np.ndarray",
+                                 lx1: int, ly1: int, lx2: int, ly2: int,
+                                 t: float, char_idx: int,
+                                 skin: tuple = (210, 170, 120)) -> Image.Image:
+    """
+    Draw the listening-hand icon onto a real-photo RGB frame for
+    SingleSceneComposer.  The hand is placed in the lower-outer corner of
+    the listener's bounding box.
+
+    Parameters
+    ──────────
+    frame    : RGB PIL Image (or numpy array) of the scene
+    lx1,ly1  : top-left of listener face bbox
+    lx2,ly2  : bottom-right of listener face bbox
+    """
+    if isinstance(frame, np.ndarray):
+        img = Image.fromarray(frame)
+    else:
+        img = frame.copy()
+
+    canvas = img.convert("RGBA")
+    fw_box = lx2 - lx1
+    fh_box = ly2 - ly1
+
+    # Treat the bbox as a mini-panel: place hand in its lower-outer corner
+    _draw_listening_hand(
+        canvas,
+        panel_x0 = lx1,
+        panel_w  = fw_box,
+        char_h   = ly2,          # bottom of bbox = char_h equivalent
+        t        = t,
+        char_idx = char_idx,
+        skin     = skin,
+    )
+    return canvas.convert("RGB")
+
+
 def _nod_curve(p: float) -> float:
     """
     Asymmetric nod shape mapped to normalised cycle phase p ∈ [0, 1].
@@ -1391,6 +1563,12 @@ class VideoComposer:
                 # Soft attention glow around the listener's head
                 _draw_attention_glow(canvas, cx=cx + ldx2, cy=face_cy,
                                      fw=self.fw, fh=self.fh, t=t)
+                # Listening-hand icon in the lower-outer corner of the panel
+                _draw_listening_hand(canvas,
+                                     panel_x0=self.panel_x[char_idx],
+                                     panel_w=self.panel_w,
+                                     char_h=self.char_h,
+                                     t=t, char_idx=char_idx)
 
         # ── Name tags ─────────────────────────────────────────────────────────
         for char_idx in (listener_idx, speaker_idx):
@@ -1761,6 +1939,12 @@ class SingleSceneComposer:
             # indicates engagement without distorting the real photo.
             frame = _draw_scene_attention_glow(
                 frame, l_cx, l_cy, l_fw, l_fh, t, color=glow_color
+            )
+
+            # ── Listener: raised-hand icon in lower-outer corner of face bbox
+            frame = _draw_scene_listening_hand(
+                frame, lx1, ly1, lx2, ly2,
+                t=t, char_idx=listener_idx
             )
 
             full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
