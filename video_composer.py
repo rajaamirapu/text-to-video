@@ -578,23 +578,87 @@ def _nod_curve(p: float) -> float:
     return 0.0                                            # rest
 
 
-def _rotate_face(img: Image.Image, angle_deg: float) -> Image.Image:
+def _apply_neck_pivot_nod(
+    scene: Image.Image,
+    face_bbox: tuple,           # (lx1, ly1, lx2, ly2) — padded face region
+    nod_angle: float,           # degrees; negative = chin forward
+    frame: Image.Image,         # current composited frame (speaker already blended)
+) -> Image.Image:
     """
-    Rotate *img* around its chin pivot (80 % down from top) to simulate a nod.
-    Positive angle = tilt backward; negative = chin forward (natural nod).
-    Uses BICUBIC resampling and keeps the original canvas size.
+    Simulate a natural head nod by rotating the listener's face around the
+    NECK pivot, which sits BELOW the face bbox.
+
+    Why this works:
+    ─────────────
+    A real nod rotates around the base of the neck (~C7 vertebra).  When the
+    pivot is below the face, a small angle (2–4°) tips the forehead forward and
+    slightly down — exactly what you see when someone nods.  Pivoting inside
+    the face (e.g. at the chin) produces a pendulum-swing that looks fake.
+
+    Implementation:
+    ──────────────
+    1. Grab a LARGE crop from the original scene that extends well below the
+       detected face so the neck-pivot point is inside the crop.
+    2. Rotate this large crop around the neck pivot.
+    3. Composite back using a soft elliptical mask that covers ONLY the face —
+       this hides any rotation artefacts at the edges of the large crop.
     """
-    if abs(angle_deg) < 0.05:
-        return img
-    w, h   = img.size
-    pivot  = (w // 2, int(h * 0.80))          # neck / chin area
-    return img.rotate(
-        angle_deg,
-        resample  = Image.BICUBIC,
-        center    = pivot,
-        expand    = False,
-        fillcolor = None,
+    if abs(nod_angle) < 0.05:
+        return frame
+
+    lx1, ly1, lx2, ly2 = face_bbox
+    l_fw = lx2 - lx1
+    l_fh = ly2 - ly1
+    img_w, img_h = scene.size
+
+    # ── 1. Define large crop (extra padding below for neck pivot) ─────────────
+    pad_x  = int(l_fw * 0.55)
+    pad_t  = int(l_fh * 0.20)           # small pad above (forehead)
+    pad_b  = int(l_fh * 0.80)           # large pad below (neck + chest)
+
+    bx1 = max(0, lx1 - pad_x)
+    by1 = max(0, ly1 - pad_t)
+    bx2 = min(img_w, lx2 + pad_x)
+    by2 = min(img_h, ly2 + pad_b)
+
+    big = scene.crop((bx1, by1, bx2, by2)).convert("RGBA")
+    bw, bh = big.size
+
+    # ── 2. Neck pivot in local coords ─────────────────────────────────────────
+    # Put pivot at ~30 % below bottom of face bbox within the large crop
+    pivot_x = bw // 2
+    pivot_y = (ly2 - by1) + int(l_fh * 0.30)
+    pivot_y = min(pivot_y, bh - 1)
+
+    rotated = big.rotate(
+        nod_angle,
+        center   = (pivot_x, pivot_y),
+        resample = Image.BICUBIC,
+        expand   = False,
     )
+
+    # ── 3. Soft face-only mask ────────────────────────────────────────────────
+    # Large ellipse covering face + generous surround, very heavy blur so the
+    # boundary between rotated region and static scene is completely invisible.
+    face_cx  = (lx1 + lx2) // 2 - bx1
+    face_cy  = (ly1 + ly2) // 2 - by1
+    half_w   = int(l_fw * 0.65)     # wider than face so edge is in background
+    half_h   = int(l_fh * 0.68)
+    blur_r   = int(min(l_fw, l_fh) * 0.45)   # heavy blur — hides boundary
+
+    mask = Image.new("L", (bw, bh), 0)
+    ImageDraw.Draw(mask).ellipse(
+        [face_cx - half_w, face_cy - half_h,
+         face_cx + half_w, face_cy + half_h],
+        fill=255,
+    )
+    mask = mask.filter(ImageFilter.GaussianBlur(blur_r))
+    rotated.putalpha(mask)
+
+    # ── 4. Composite over the current frame (speaker already blended in) ──────
+    out = frame.convert("RGBA")
+    out.paste(rotated, (bx1, by1), rotated)
+    return out.convert("RGB")
 
 
 def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> float:
@@ -611,15 +675,15 @@ def _listener_nod(t: float, char_idx: int, emotion: str = "neutral") -> float:
     irr   = 1.0 + 0.10 * math.sin(2 * math.pi * 0.09 * t + phase * 1.7)
 
     if emotion == "excited":
-        freq, amp = 1.10, 7.0     # fast, bigger tilt
+        freq, amp = 1.00, 8.0     # fast, clearly visible
     elif emotion == "surprised":
-        freq, amp = 1.00, 5.5
+        freq, amp = 0.90, 6.5
     elif emotion == "thoughtful":
-        freq, amp = 0.55, 6.0     # slower, deliberate
+        freq, amp = 0.50, 7.0     # slow, deliberate
     elif emotion == "happy":
-        freq, amp = 0.85, 5.5
+        freq, amp = 0.75, 6.5
     else:
-        freq, amp = 0.70, 5.0     # neutral — clear, not too fast
+        freq, amp = 0.65, 6.0     # neutral — natural and visible
 
     p = (t * freq + phase / (2 * math.pi)) % 1.0
     return _nod_curve(p) * amp * irr
@@ -1246,12 +1310,21 @@ class VideoComposer:
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
-                # Listener: rotation-based nod (chin pivot) + gentle sway
+                # Listener: neck-pivot nod on the portrait image
                 nod_angle        = _listener_nod(t, char_idx, emotion=emotion)
                 l_face, ldx, ldy = _animate_face(
                     listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
                 )
-                l_face = _rotate_face(l_face, nod_angle)
+                if abs(nod_angle) > 0.05:
+                    lw, lh   = l_face.size
+                    # Pivot below the portrait (neck: 30% below bottom edge of face)
+                    piv_y = int(lh * 1.30)
+                    l_face = l_face.rotate(
+                        nod_angle,
+                        center=(lw // 2, piv_y),
+                        resample=Image.BICUBIC,
+                        expand=False,
+                    )
                 ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
                 _blend_panel_face(canvas, l_face, px0,
                                   cy + ldy2,
@@ -1619,23 +1692,11 @@ class SingleSceneComposer:
             # ── Speaker: Wav2Lip animated lip region ──────────────────────────
             frame = _blend_face_into_scene(self.scene, spk_frame, pbbox)
 
-            # ── Listener: rotation nod at same position (no spatial shift) ──────
+            # ── Listener: neck-pivot nod ──────────────────────────────────────
             nod_angle = _listener_nod(t, listener_idx, emotion=emotion)
-            # Extract face crop from original undistorted scene
-            listen_crop = self.scene.crop((lx1, ly1, lx2, ly2)).convert("RGBA")
-            # Rotate around chin pivot — this is the actual nod motion
-            listen_crop = _rotate_face(listen_crop, nod_angle)
-            # Blend back at the SAME position (no spatial drift, no seams)
-            frame_rgba  = frame.convert("RGBA")
-            mw, mh      = listen_crop.size
-            margin      = int(min(mw, mh) * 0.10)
-            mask_img    = Image.new("L", (mw, mh), 0)
-            mask_d      = ImageDraw.Draw(mask_img)
-            mask_d.ellipse([margin, margin, mw - margin, mh - margin], fill=240)
-            mask_img    = mask_img.filter(ImageFilter.GaussianBlur(int(min(mw, mh) * 0.12)))
-            listen_crop.putalpha(mask_img)
-            frame_rgba.paste(listen_crop, (lx1, ly1), listen_crop)
-            frame = frame_rgba.convert("RGB")
+            frame = _apply_neck_pivot_nod(
+                self.scene, (lx1, ly1, lx2, ly2), nod_angle, frame
+            )
             full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
             full.paste(frame, (0, 0))
             full.paste(subtitle, (0, self.char_h))
