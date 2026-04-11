@@ -626,147 +626,186 @@ def _draw_scene_attention_glow(frame: Image.Image,
     return canvas.convert("RGB")
 
 
-def _build_hand_icon(size: int = 200) -> Image.Image:
+def _build_hand_icon(size: int = 320) -> Image.Image:
     """
-    Build a realistic open-palm raised-hand RGBA image at the requested pixel
-    size using bezier-curve outlines.
+    Build a photo-realistic open-palm raised-hand RGBA image.
 
-    The hand is drawn at `size` × `size` pixels with a transparent background.
-    Returns a PIL RGBA Image.  The result is cached in `_HAND_ICON_CACHE`.
+    Rendering uses aggdraw (anti-aliased cubic bezier paths) + PIL gradient
+    layers to achieve a natural hand appearance:
 
-    Shape
-    ─────
-    • Palm: rounded filled polygon
-    • 4 fingers (pinky → index): cubic bezier outlines, tapered tips,
-      rounded fingernails, two knuckle creases per finger
-    • Thumb: diagonal bezier, same style
-    • Subtle highlight ellipse on palm, drop shadow underneath
+      • Unified palm + wrist silhouette (single connected path, no seams)
+      • 4 fingers with tapered bezier outlines, knuckle creases, fingernails
+        and lunula (half-moon) highlights
+      • Thumb attached to palm right edge, with its own crease and nail
+      • Subsurface-scattering simulation: warm pink glow at each fingertip
+      • Directional highlight on palm (lit from upper-left)
+      • Palm life/heart creases
+      • Drop shadow at wrist base
+
+    The result is cached by `_get_hand_icon(size)` and only built once.
     """
+    try:
+        import aggdraw as _agg
+    except ImportError:
+        _agg = None
 
-    def _bez4(p0, p1, p2, p3, n=30):
-        t = np.linspace(0, 1, n)[:, None]
-        pts = ((1-t)**3 * np.array(p0) + 3*(1-t)**2*t * np.array(p1) +
-               3*(1-t)*t**2 * np.array(p2) + t**3 * np.array(p3))
-        return [(int(x), int(y)) for x, y in pts]
+    S        = size
+    SK       = (210, 165, 118)   # base skin
+    SK_L     = (238, 205, 162)   # highlight
+    SK_D     = (158, 108,  64)   # shadow / crease / outline
+    SK_P     = (240, 170, 145)   # subsurface-scatter pink at tips
+    NAIL     = (230, 208, 188)   # nail plate
+    LUNA     = (248, 238, 226)   # lunula (white half-moon)
 
-    S = size
-    C_SKIN  = (218, 175, 125)
-    C_LIGHT = (235, 198, 150)
-    C_DARK  = (162, 118, 70)
-    C_NAIL  = (228, 200, 178)
+    canvas   = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    cx       = int(S * 0.44)
+    cy_p     = int(S * 0.68)
+    pw       = int(S * 0.37)   # palm half-width
+    ph       = int(S * 0.24)   # palm half-height
+    top_y    = cy_p - ph + 4
+    wbot     = int(S * 0.92)   # wrist bottom y
 
-    # ── Palm ──────────────────────────────────────────────────────────────────
-    pcx, pcy = int(S * 0.46), int(S * 0.72)
-    pw  = int(S * 0.40)     # half-width
-    ph  = int(S * 0.28)     # half-height
+    # ── SVG-style path helpers ────────────────────────────────────────────────
+    def _M(x, y):                         return f"M {x} {y} "
+    def _C(x1,y1, x2,y2, x,y):           return f"C {x1} {y1} {x2} {y2} {x} {y} "
+    def _L(x, y):                         return f"L {x} {y} "
+    def _Z():                             return "Z"
 
-    palm_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    pd         = ImageDraw.Draw(palm_layer)
+    def _safe_e(d, x0, y0, x1, y1, **kw):
+        x0, x1 = min(x0,x1), max(x0+2, x1)
+        y0, y1 = min(y0,y1), max(y0+2, y1)
+        d.ellipse([x0, y0, x1, y1], **kw)
 
-    top_y = pcy - ph + 6
-    # Bottom arch
-    bot = _bez4((pcx-pw, pcy+ph//2), (pcx-pw//2, pcy+ph),
-                (pcx+pw//2, pcy+ph), (pcx+pw-10, pcy+ph//2))
-    # Left edge
-    lft = _bez4((pcx-pw, pcy+ph//2), (pcx-pw-4, pcy),
-                (pcx-pw, pcy-ph//3), (pcx-int(pw*0.75), top_y))
-    # Right edge (thumb notch)
-    rgt = _bez4((pcx+pw-10, pcy+ph//2), (pcx+pw+4, pcy+ph//6),
-                (pcx+pw+2, pcy-ph//4), (pcx+int(pw*0.60), top_y))
+    def _agg_layer(path, fill, outline=None, ow=1.2):
+        """Render one anti-aliased aggdraw path onto a transparent RGBA layer."""
+        if _agg is None:
+            # Fallback: plain PIL polygon (no anti-aliasing)
+            img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            return img
+        img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        a   = _agg.Draw(img)
+        sym = _agg.Symbol(path)
+        pen = _agg.Pen(outline[:3], ow, outline[3]) if outline else None
+        br  = _agg.Brush(fill[:3], fill[3])
+        a.symbol((0, 0), sym, pen, br)
+        a.flush()
+        return img
 
-    palm_poly = lft + [(pcx+int(pw*0.60), top_y), (pcx-int(pw*0.75), top_y)] + lft[-1:] + bot[::-1] + rgt[::-1]
-    pd.polygon(lft + [(pcx-int(pw*0.75), top_y), (pcx+int(pw*0.60), top_y)]
-               + rgt[::-1] + bot[::-1],
-               fill=(*C_SKIN, 255))
+    # ── Palm + wrist (one unified path, no seam) ──────────────────────────────
+    palm_path = (
+        _M(cx-pw+16, wbot) +
+        _C(cx-pw+14, cy_p+ph,   cx-pw-4, cy_p,         cx-pw,            cy_p) +
+        _C(cx-pw-6,  cy_p-ph//3, cx-pw-2, cy_p-ph*2//3, cx-int(pw*.72),   top_y) +
+        _L(cx+int(pw*.58), top_y) +
+        _C(cx+pw+2,  cy_p-ph*2//3, cx+pw+4, cy_p-ph//4, cx+pw-6,          cy_p+ph//3) +
+        _C(cx+pw-4,  cy_p+ph,      cx+pw-18, wbot,       cx+pw-18,         wbot) +
+        _C(cx+pw-18, wbot+8,       cx-pw+16, wbot+8,     cx-pw+16,         wbot) +
+        _Z()
+    )
+    canvas = Image.alpha_composite(canvas,
+                                   _agg_layer(palm_path, (*SK, 255), (*SK_D, 80)))
 
-    # ── Fingers ───────────────────────────────────────────────────────────────
-    finger_defs = [
-        # pinky
-        dict(bx=pcx-int(pw*0.68), by=top_y+4,
-             c1=(pcx-int(pw*0.70), int(S*0.38)),
-             c2=(pcx-int(pw*0.65), int(S*0.22)),
-             tx=pcx-int(pw*0.63), ty=int(S*0.15), hwb=7, hwt=5),
-        # ring
-        dict(bx=pcx-int(pw*0.28), by=top_y,
-             c1=(pcx-int(pw*0.28), int(S*0.34)),
-             c2=(pcx-int(pw*0.24), int(S*0.16)),
-             tx=pcx-int(pw*0.22), ty=int(S*0.09), hwb=9, hwt=6),
-        # middle (tallest)
-        dict(bx=pcx+int(pw*0.06), by=top_y-4,
-             c1=(pcx+int(pw*0.06), int(S*0.31)),
-             c2=(pcx+int(pw*0.08), int(S*0.12)),
-             tx=pcx+int(pw*0.08), ty=int(S*0.05), hwb=9, hwt=7),
-        # index
-        dict(bx=pcx+int(pw*0.40), by=top_y+2,
-             c1=(pcx+int(pw*0.42), int(S*0.33)),
-             c2=(pcx+int(pw*0.46), int(S*0.16)),
-             tx=pcx+int(pw*0.46), ty=int(S*0.10), hwb=9, hwt=6),
-    ]
+    # Palm highlight (soft lit ellipse upper-left)
+    hl = Image.new("RGBA", (S, S), (0, 0, 0, 0)); hd = ImageDraw.Draw(hl)
+    _safe_e(hd, cx-pw+8, cy_p-ph, cx+int(pw*.22), cy_p+ph//4, fill=(*SK_L, 55))
+    canvas = Image.alpha_composite(canvas, hl.filter(ImageFilter.GaussianBlur(18)))
 
-    fing_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    fd         = ImageDraw.Draw(fing_layer)
-
-    for f in finger_defs:
-        bx, by, tx, ty   = f['bx'], f['by'], f['tx'], f['ty']
-        hwb, hwt          = f['hwb'], f['hwt']
-        c1, c2            = f['c1'],  f['c2']
-        L   = _bez4((bx-hwb, by),  (c1[0]-hwb+1, c1[1]),
-                    (c2[0]-hwt,   c2[1]),  (tx-hwt, ty))
-        R   = _bez4((tx+hwt, ty),  (c2[0]+hwt, c2[1]),
-                    (c1[0]+hwb-1, c1[1]),  (bx+hwb, by))
-        tip = [(int(tx + hwt*np.cos(a)), int(ty + hwt*np.sin(a)))
-               for a in np.linspace(np.pi, 0, 12)]
-        fd.polygon(L + tip + R, fill=(*C_SKIN, 255), outline=(*C_DARK, 180))
-        # Fingernail
-        nw, nh = hwt-2, hwt-1
-        fd.ellipse([tx-nw, ty-nh*2, tx+nw, ty], fill=(*C_NAIL, 210))
-        # Two knuckle creases
-        for frac in (0.33, 0.66):
-            jx = bx + int((tx-bx)*frac)
-            jy = by + int((ty-by)*frac)
-            jw = max(3, hwb - int((hwb-hwt)*frac) - 1)
-            fd.arc([jx-jw, jy-2, jx+jw, jy+2], 195, 345,
-                   fill=(*C_DARK, 65), width=1)
+    # Palm creases (heart + life lines)
+    for crease in (
+        _M(cx-pw+22, cy_p-int(ph*.10)) +
+        _C(cx-pw//3, cy_p-int(ph*.28), cx+pw//4, cy_p-int(ph*.18),
+           cx+int(pw*.50), cy_p-int(ph*.02)),
+        _M(cx-int(pw*.06), cy_p+int(ph*.20)) +
+        _C(cx+int(pw*.20), cy_p-int(ph*.04), cx+int(pw*.38), cy_p-int(ph*.16),
+           cx+int(pw*.50), top_y+int(ph*.30)),
+    ):
+        canvas = Image.alpha_composite(canvas,
+                                       _agg_layer(crease, (0,0,0,0), (*SK_D, 52), 1.3))
 
     # ── Thumb ─────────────────────────────────────────────────────────────────
-    thumb_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    td          = ImageDraw.Draw(thumb_layer)
-    tbx, tby    = pcx+int(pw*0.62), pcy-int(ph*0.55)
-    ttx, tty    = pcx+int(pw*1.05), pcy-int(ph*1.20)
-    hwb2, hwt2  = 9, 7
-    half        = ((tbx+ttx)//2, (tby+tty)//2)
-    L   = _bez4((tbx-hwb2+2, tby+5), (tbx-4, half[1]),
-                (ttx-hwt2-2, half[1]-6), (ttx-hwt2, tty))
-    R   = _bez4((ttx+hwt2, tty), (ttx+hwt2+2, half[1]-6),
-                (tbx+4, half[1]), (tbx+hwb2-2, tby+5))
-    tip = [(int(ttx + hwt2*np.cos(a)), int(tty + hwt2*np.sin(a)))
-           for a in np.linspace(np.pi, 0, 10)]
-    td.polygon(L + tip + R, fill=(*C_SKIN, 255), outline=(*C_DARK, 180))
-    td.ellipse([ttx-hwt2+1, tty-hwt2*2, ttx+hwt2-1, tty],
-               fill=(*C_NAIL, 200))
+    tbx, tby = cx+int(pw*.56), cy_p-int(ph*.22)
+    ttx, tty = cx+int(pw*.95), cy_p-int(ph*1.12)
+    hwb2=11; hwt2=8; hx=(tbx+ttx)//2; hy=(tby+tty)//2
+    thumb_path = (
+        _M(tbx-hwb2+2, tby+12) +
+        _C(tbx-6, hy+8,   ttx-hwt2-2, hy-5,  ttx-hwt2, tty) +
+        _C(ttx-hwt2+1, tty-hwt2, ttx+hwt2-1, tty-hwt2, ttx+hwt2, tty) +
+        _C(ttx+hwt2+2, hy-5,   tbx+6,    hy+8,  tbx+hwb2+2, tby+8) +
+        _Z()
+    )
+    canvas = Image.alpha_composite(canvas,
+                                   _agg_layer(thumb_path, (*SK, 255), (*SK_D, 110)))
+    # Thumb subsurface tip
+    tst = Image.new("RGBA", (S, S), (0,0,0,0)); tsd = ImageDraw.Draw(tst)
+    _safe_e(tsd, ttx-hwt2, tty-hwt2*3, ttx+hwt2, tty+hwt2, fill=(*SK_P, 58))
+    canvas = Image.alpha_composite(canvas, tst.filter(ImageFilter.GaussianBlur(5)))
+    # Thumb crease
+    tkp = _M(hx-hwb2+3, hy) + _C(hx-3, hy-4, hx+3, hy-4, hx+hwb2-3, hy)
+    canvas = Image.alpha_composite(canvas, _agg_layer(tkp, (0,0,0,0), (*SK_D, 62), 1.2))
+    # Thumb nail + lunula
+    tnl = Image.new("RGBA", (S, S), (0,0,0,0)); tnd = ImageDraw.Draw(tnl)
+    _safe_e(tnd, ttx-hwt2+1, tty-hwt2*3, ttx+hwt2-1, tty+hwt2//2, fill=(*NAIL, 205))
+    _safe_e(tnd, ttx-hwt2+2, tty-hwt2+3, ttx+hwt2-2, tty+hwt2//2+2, fill=(*LUNA, 112))
+    canvas = Image.alpha_composite(canvas, tnl)
 
-    # ── Assemble: palm → fingers → thumb ─────────────────────────────────────
-    result = palm_layer
-    result = Image.alpha_composite(result, fing_layer)
-    result = Image.alpha_composite(result, thumb_layer)
+    # ── Fingers (pinky → index) ───────────────────────────────────────────────
+    fingers = [
+        (cx-int(pw*.65), top_y+6,
+         (cx-int(pw*.67), int(S*.36)), (cx-int(pw*.61), int(S*.21)),
+         cx-int(pw*.59), int(S*.148), 8, 6),
+        (cx-int(pw*.27), top_y+2,
+         (cx-int(pw*.27), int(S*.32)), (cx-int(pw*.23), int(S*.14)),
+         cx-int(pw*.21), int(S*.085), 10, 7),
+        (cx+int(pw*.07), top_y-3,
+         (cx+int(pw*.07), int(S*.29)), (cx+int(pw*.09), int(S*.10)),
+         cx+int(pw*.09), int(S*.042), 10, 8),
+        (cx+int(pw*.38), top_y+1,
+         (cx+int(pw*.40), int(S*.31)), (cx+int(pw*.44), int(S*.148)),
+         cx+int(pw*.44), int(S*.095), 10, 7),
+    ]
 
-    # ── Palm highlight (soft bright ellipse centre-top) ───────────────────────
-    hl = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(hl)
-    hd.ellipse([pcx-pw//2, pcy-ph, pcx+pw//2, pcy+ph//3],
-               fill=(*C_LIGHT, 40))
-    hl = hl.filter(ImageFilter.GaussianBlur(10))
-    result = Image.alpha_composite(result, hl)
+    for (bx, by, c1, c2, tx, ty, hwb, hwt) in fingers:
+        fpath = (
+            _M(bx-hwb, by) +
+            _C(bx-hwb, c1[1], c2[0]-hwt, c2[1], tx-hwt, ty) +
+            _C(tx-hwt+1, ty-hwt, tx+hwt-1, ty-hwt, tx+hwt, ty) +
+            _C(c2[0]+hwt, c2[1], bx+hwb, c1[1], bx+hwb, by) + _Z()
+        )
+        canvas = Image.alpha_composite(canvas,
+                                       _agg_layer(fpath, (*SK, 255), (*SK_D, 110)))
 
-    # ── Drop shadow at base ───────────────────────────────────────────────────
-    shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    sd     = ImageDraw.Draw(shadow)
-    sd.ellipse([pcx-pw+8, pcy+ph-4, pcx+pw-20, S-2], fill=(0, 0, 0, 70))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(6))
-    final  = Image.alpha_composite(shadow, result)
+        # Lit-edge highlight strip (left side of each finger)
+        hl2 = Image.new("RGBA", (S,S), (0,0,0,0)); hd2 = ImageDraw.Draw(hl2)
+        _safe_e(hd2, bx-hwb, by, bx-hwb+5, max(by+4, ty), fill=(*SK_L, 45))
+        canvas = Image.alpha_composite(canvas, hl2.filter(ImageFilter.GaussianBlur(3)))
 
-    # Slight smooth pass for sub-pixel quality
-    return final.filter(ImageFilter.GaussianBlur(0.6))
+        # Subsurface pink at fingertip
+        sst = Image.new("RGBA", (S,S), (0,0,0,0)); ssd = ImageDraw.Draw(sst)
+        _safe_e(ssd, tx-hwt, ty-hwt*3, tx+hwt, ty+hwt, fill=(*SK_P, 58))
+        canvas = Image.alpha_composite(canvas, sst.filter(ImageFilter.GaussianBlur(5)))
+
+        # Two knuckle creases per finger
+        for frac in (0.30, 0.60):
+            jx = int(bx + (tx-bx)*frac); jy = int(by + (ty-by)*frac)
+            jw = max(3, hwb - int((hwb-hwt)*frac))
+            kp = _M(jx-jw+1, jy) + _C(jx-jw//2, jy-3, jx+jw//2, jy-3, jx+jw-1, jy)
+            canvas = Image.alpha_composite(canvas,
+                                           _agg_layer(kp, (0,0,0,0), (*SK_D, 68), 1.2))
+
+        # Fingernail plate + lunula
+        nail = Image.new("RGBA", (S,S), (0,0,0,0)); nd = ImageDraw.Draw(nail)
+        nw, nh = hwt-1, hwt
+        _safe_e(nd, tx-nw, ty-nh*3, tx+nw, ty+nh//2,   fill=(*NAIL, 210))
+        _safe_e(nd, tx-nw+1, ty-nh+2, tx+nw-1, ty+nh//2+1, fill=(*LUNA, 118))
+        canvas = Image.alpha_composite(canvas, nail)
+
+    # ── Drop shadow at wrist ──────────────────────────────────────────────────
+    shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0)); sd = ImageDraw.Draw(shadow)
+    _safe_e(sd, cx-pw+14, cy_p+ph, cx+pw-20, wbot+6, fill=(0, 0, 0, 65))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(10))
+    final  = Image.alpha_composite(shadow, canvas)
+
+    return final.filter(ImageFilter.GaussianBlur(0.35))
 
 
 # Module-level cache: {size: RGBA Image}  — rebuilt once per unique size
