@@ -55,6 +55,60 @@ os.environ.setdefault("NCCL_IB_DISABLE",  "1")
 from PIL import Image
 
 
+# ── Flash Attention compatibility check ───────────────────────────────────────
+
+def _flash_attn_ok() -> bool:
+    """
+    Return True only if flash-attn is importable AND its C++ kernel schema
+    matches the running PyTorch version.
+
+    Flash Attention must be compiled for the *exact* torch+CUDA combo.
+    Common mismatch:  flash-attn 2.5.x compiled for torch 2.0/2.1, but
+    torch 2.2+ changed the  aten::_flash_attention_forward  return schema
+    from 4 tensors to 5 tensors.  Importing the wheel succeeds; using it
+    raises  "does not have a compatible aten::_flash_attention_forward schema".
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent("""\
+            import os
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+            os.environ["NCCL_IB_DISABLE"]  = "1"
+            import torch
+            import flash_attn
+            # Trigger the schema validation
+            from flash_attn import flash_attn_func
+            q = torch.randn(1, 4, 1, 32, device="cuda", dtype=torch.float16)
+            flash_attn_func(q, q, q)
+            print("ok")
+        """)],
+        capture_output=True, text=True,
+    )
+    ok = result.returncode == 0 and "ok" in result.stdout
+    if not ok and result.stderr:
+        needle = "compatible aten::_flash_attention_forward"
+        if needle in result.stderr or "schema" in result.stderr.lower():
+            print(
+                "  [OpenSora] flash-attn schema mismatch detected — "
+                "will use xformers / standard attention instead."
+            )
+    return ok
+
+
+# Module-level cached result (computed once per process)
+_FLASH_ATTN_AVAILABLE: bool | None = None
+
+
+def _use_flash_attn() -> bool:
+    """Cached wrapper around _flash_attn_ok()."""
+    global _FLASH_ATTN_AVAILABLE
+    if _FLASH_ATTN_AVAILABLE is None:
+        try:
+            _FLASH_ATTN_AVAILABLE = _flash_attn_ok()
+        except Exception:
+            _FLASH_ATTN_AVAILABLE = False
+    return _FLASH_ATTN_AVAILABLE
+
+
 # ── locate the Open-Sora repo ─────────────────────────────────────────────────
 
 def _find_opensora_root() -> str | None:
@@ -150,6 +204,19 @@ def _write_temp_config(
         nf = ((nf - 1) // 4) * 4 + 1
         print(f"  [OpenSora] Adjusted num_frames to {nf} (must be 4k+1)")
 
+    # Check flash-attn once; disable it in the config if it's broken
+    flash_ok = _use_flash_attn()
+    attn_override = "" if flash_ok else textwrap.dedent("""\
+
+        # flash-attn schema mismatch — disable to fall back to xformers/standard attn
+        model = dict(
+            enable_flash_attn=False,
+            enable_layernorm_kernel=False,
+        )
+    """)
+    if not flash_ok:
+        print("  [OpenSora] flash-attn disabled in config (schema incompatible with torch).")
+
     config_str = textwrap.dedent(f"""\
         # Auto-generated config for opensora_generator.py
         # Base: configs/opensora-v1-2/inference/sample_hf.py
@@ -170,7 +237,7 @@ def _write_temp_config(
 
         # Prompt is passed on the command line via --prompt
         prompt = None
-    """)
+    """) + attn_override
 
     tmp_cfg = tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", prefix="opensora_cfg_", delete=False
@@ -323,12 +390,13 @@ def _get_pipeline_api(
         MODELS,
     ).to(device, dtype)
 
+    flash_ok = _use_flash_attn()
     model = build_module(
         dict(type="STDiT3-XL/2",
              from_pretrained=model_id,
              qk_norm=True,
-             enable_flash_attn=True,
-             enable_layernorm_kernel=True,
+             enable_flash_attn=flash_ok,
+             enable_layernorm_kernel=flash_ok,   # also requires triton; skip if flash-attn broken
              force_huggingface=True),
         MODELS,
     ).to(device, dtype).eval()

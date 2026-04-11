@@ -54,6 +54,35 @@ MIN_VRAM_GB = 16
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _check_flash_attn() -> bool:
+    """
+    Return True only if flash-attn is installed AND its kernel schema matches
+    the running PyTorch.  Does the check in a subprocess so a crash/ImportError
+    doesn't kill this setup script.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "import os; "
+            "os.environ['NCCL_P2P_DISABLE']='1'; "
+            "os.environ['NCCL_IB_DISABLE']='1'; "
+            "import torch; import flash_attn; "
+            "from flash_attn import flash_attn_func; "
+            "q=torch.randn(1,4,1,32,device='cuda',dtype=torch.float16); "
+            "flash_attn_func(q,q,q); print('ok')"
+        )],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and "ok" in result.stdout:
+        return True
+    # Log the actual mismatch for the user's benefit
+    if "schema" in result.stderr or "aten::_flash_attention_forward" in result.stderr:
+        print(
+            "  flash-attn: aten::_flash_attention_forward schema mismatch\n"
+            f"              {result.stderr.splitlines()[0] if result.stderr else ''}"
+        )
+    return False
+
+
 def banner(msg: str):
     w = max(60, len(msg) + 4)
     print(f"\n{'─'*w}\n  {msg}\n{'─'*w}")
@@ -240,13 +269,29 @@ def install_dependencies(opensora_dir: str):
              "xformers==0.0.25.post1",
              "--index-url", "https://download.pytorch.org/whl/cu121"], check=False)
 
-    # Flash Attention 2 (optional — faster but requires nvcc)
-    try:
-        import flash_attn; print("  flash-attn: already installed")  # noqa: E401
-    except ImportError:
-        print("  Attempting flash-attn install (needs nvcc — skip if it fails) …")
-        run([sys.executable, "-m", "pip", "install",
-             "flash-attn", "--no-build-isolation"], check=False)
+    # ── Flash Attention 2 ─────────────────────────────────────────────────────
+    # flash-attn must be compiled for the exact (torch, CUDA) combination.
+    # A version mismatch causes:
+    #   "does not have a compatible aten::_flash_attention_forward schema"
+    # We detect that at runtime and uninstall the offending wheel.
+    # Flash-attn is purely optional — Open-Sora falls back to xformers or
+    # standard scaled-dot-product attention when it's absent.
+    flash_ok = _check_flash_attn()
+    if flash_ok:
+        print("  flash-attn: installed and schema-compatible ✓")
+    else:
+        # Uninstall whatever broken version is there
+        _result = subprocess.run(
+            [sys.executable, "-m", "pip", "show", "flash-attn"],
+            capture_output=True,
+        )
+        if _result.returncode == 0:
+            print("  flash-attn: schema incompatible — uninstalling …")
+            run([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y"],
+                check=False)
+            print("  flash-attn: removed.  Open-Sora will use xformers/sdp attention.")
+        else:
+            print("  flash-attn: not installed — Open-Sora will use xformers/sdp attention.")
 
 
 # ── Step 4: download model weights ────────────────────────────────────────────
