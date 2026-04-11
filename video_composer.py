@@ -1062,11 +1062,38 @@ class VideoComposer:
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
-                # Listener: completely still portrait (no nod, sway, or overlays)
-                l_face = listener_face.resize(
-                    (max(1, int(self.fw)), max(1, int(self.fh))), Image.LANCZOS
+                # Listener: animated portrait with nod, sway, and expressions
+                nod_dy           = _listener_nod(t, char_idx, emotion=emotion)
+                l_face, ldx, ldy = _animate_face(
+                    listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
                 )
-                _blend_panel_face(canvas, l_face, px0, cy, l_face.width, l_face.height)
+                ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
+                _blend_panel_face(canvas, l_face, px0,
+                                  cy + ldy2 + nod_dy,
+                                  l_face.width, l_face.height)
+                # Expression overlays (raised brows, blush, smile, etc.)
+                _draw_expression(
+                    canvas,
+                    cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
+                    fw=self.fw, fh=self.fh,
+                    emotion=emotion, t=t, char_idx=char_idx,
+                )
+                # Eye blink
+                blink_a = _blink_alpha(t, char_idx)
+                if blink_a > 0.04:
+                    _draw_eye_blink(
+                        canvas,
+                        cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
+                        fw=self.fw, fh=self.fh,
+                        alpha=blink_a,
+                    )
+                # Gaze toward speaker
+                _draw_gaze_toward_speaker(
+                    canvas,
+                    cx=cx + ldx2, cy=cy + ldy2 + nod_dy,
+                    fw=self.fw, fh=self.fh,
+                    listener_idx=char_idx, t=t,
+                )
 
         # ── Name tags ─────────────────────────────────────────────────────────
         for char_idx in (listener_idx, speaker_idx):
@@ -1408,18 +1435,70 @@ class SingleSceneComposer:
             except Exception:
                 audio_ok = False
 
-        duration = max(audio_dur, 0.5)
-        pbbox    = self._padded[speaker_idx]
-        subtitle = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
+        duration     = max(audio_dur, 0.5)
+        pbbox        = self._padded[speaker_idx]
+        listener_idx = 1 - speaker_idx
+        emotion      = _detect_emotion(dialogue_text)
+        subtitle     = _subtitle_img(self.width, self.sub_h, speaker_name, dialogue_text)
 
-        print(f"  [Scene] speaker={speaker_name}  bbox={pbbox}")
+        # Listener face geometry for overlay helpers
+        lx1, ly1, lx2, ly2 = self._padded[listener_idx]
+        l_fw = lx2 - lx1
+        l_fh = ly2 - ly1
+        l_cx = (lx1 + lx2) // 2
+        l_cy = (ly1 + ly2) // 2
+
+        print(f"  [Scene] Emotion: {emotion!r}  speaker={speaker_name}  bbox={pbbox}")
 
         def make_frame(t: float) -> np.ndarray:
             safe_t    = max(0.0, min(t, wav2lip_dur - 1.0 / max(1, self.fps)))
             spk_frame = talking.get_frame(safe_t)
 
-            # Scene stays completely still; only the speaker's lips animate.
+            # ── Speaker: Wav2Lip animated lip region ──────────────────────────
             frame = _blend_face_into_scene(self.scene, spk_frame, pbbox)
+
+            # ── Listener: nod / sway by re-blending shifted crop ──────────────
+            nod_dy       = _listener_nod(t, listener_idx, emotion=emotion)
+            sdx, sdy     = _sway_offset(t, listener_idx, is_speaking=False, emotion=emotion)
+            shift_x      = int(sdx)
+            shift_y      = int(sdy + nod_dy)
+            img_w, img_h = frame.size
+            nx1 = max(0, min(lx1 + shift_x, img_w - 1))
+            ny1 = max(0, min(ly1 + shift_y, img_h - 1))
+            nx2 = max(nx1 + 1, min(lx2 + shift_x, img_w))
+            ny2 = max(ny1 + 1, min(ly2 + shift_y, img_h))
+
+            listen_crop = self.scene.crop((lx1, ly1, lx2, ly2)).convert("RGBA")
+            frame_rgba  = frame.convert("RGBA")
+            mask_img    = Image.new("L", listen_crop.size, 0)
+            mask_d      = ImageDraw.Draw(mask_img)
+            mw, mh      = listen_crop.size
+            margin      = int(min(mw, mh) * 0.12)
+            mask_d.ellipse([margin, margin, mw - margin, mh - margin], fill=240)
+            mask_img    = mask_img.filter(ImageFilter.GaussianBlur(int(min(mw, mh) * 0.08)))
+            listen_crop.putalpha(mask_img)
+            frame_rgba.paste(listen_crop, (nx1, ny1), listen_crop)
+            frame = frame_rgba.convert("RGB")
+
+            # ── Expressions, blink, gaze on listener ──────────────────────────
+            frame_rgba2 = frame.convert("RGBA")
+            adj_cx = l_cx + shift_x
+            adj_cy = l_cy + shift_y
+            _draw_expression(
+                frame_rgba2, cx=adj_cx, cy=adj_cy,
+                fw=l_fw, fh=l_fh, emotion=emotion, t=t, char_idx=listener_idx,
+            )
+            blink_a = _blink_alpha(t, listener_idx)
+            if blink_a > 0.04:
+                _draw_eye_blink(
+                    frame_rgba2, cx=adj_cx, cy=adj_cy,
+                    fw=l_fw, fh=l_fh, alpha=blink_a,
+                )
+            _draw_gaze_toward_speaker(
+                frame_rgba2, cx=adj_cx, cy=adj_cy,
+                fw=l_fw, fh=l_fh, listener_idx=listener_idx, t=t,
+            )
+            frame = frame_rgba2.convert("RGB")
 
             full = Image.new("RGB", (self.width, self.height), (8, 8, 8))
             full.paste(frame, (0, 0))
