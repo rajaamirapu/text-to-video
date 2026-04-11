@@ -24,7 +24,25 @@ diffusers>=0.29.0         # HuggingFace Diffusers (SD pipeline)
 transformers>=4.41.0      # tokenizers, CLIP text encoder
 accelerate>=0.30.0        # fast model loading / mixed-precision
 # torch is a prerequisite but installed separately (CUDA vs CPU variant):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# ── Open-Sora text-to-video generation ────────────────────────────────────────
+# Open-Sora itself is installed via setup_opensora.py (clones + pip installs).
+# The packages below are its runtime dependencies that we list here for reference.
+# DO NOT pip install these directly — use setup_opensora.py instead.
+#
+#   huggingface_hub>=0.22.0       # model weight download
+#   einops                        # tensor rearrangement
+#   rotary_embedding_torch        # RoPE embeddings used by STDiT3
+#   timm                          # image model utilities
+#   colossalai                    # parallelism / mixed-precision training utils
+#   flash-attn                    # (optional) fast attention — install separately
+#   xformers                      # (optional) memory-efficient attention fallback
+#   aggdraw                       # anti-aliased 2D drawing (hand icon rendering)
+#
+# GPU requirement: CUDA GPU with ≥ 16 GB VRAM (A100 / A10G / RTX 4090 etc.)
+# Setup:  python setup_opensora.py
+# Usage:  python main.py script.json --use-opensora
 
 # ── Wav2Lip native dependencies (installed via Wav2Lip/requirements.txt) ───────
 # numpy, opencv-python, torch, batch_face_detection, librosa, etc.

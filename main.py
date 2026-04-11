@@ -315,6 +315,52 @@ def main():
                         help="Silence gap between dialogue lines in seconds")
     parser.add_argument("--no-gan",  action="store_true",
                         help="Use wav2lip.pth instead of wav2lip_gan.pth (faster)")
+
+    # ── Open-Sora flags ───────────────────────────────────────────────────────
+    parser.add_argument(
+        "--use-opensora",
+        action="store_true",
+        help=(
+            "Use Open-Sora (text-to-video diffusion) instead of Stable Diffusion "
+            "for character portrait generation. Open-Sora produces short animated "
+            "video clips per character; the first frame is fed to Wav2Lip for lip "
+            "sync and the full clip loops as the 'listening' animation. "
+            "Requires GPU with ≥16 GB VRAM and a prior run of setup_opensora.py."
+        ),
+    )
+    parser.add_argument(
+        "--opensora-bg",
+        action="store_true",
+        help="Also generate the background with Open-Sora (animated looping scene). "
+             "Only active when --use-opensora is set.",
+    )
+    parser.add_argument(
+        "--opensora-resolution",
+        default="480p",
+        choices=["240p", "360p", "480p", "720p"],
+        help="Open-Sora output resolution (default: 480p). "
+             "Higher resolutions require more VRAM and time.",
+    )
+    parser.add_argument(
+        "--opensora-frames",
+        type=int,
+        default=49,
+        help="Number of frames per Open-Sora clip (default: 49 ≈ 2 s at 24 fps). "
+             "Must be 4k+1: 17, 33, 49, 65, 97 …",
+    )
+    parser.add_argument(
+        "--opensora-cli",
+        action="store_true",
+        help="Run Open-Sora via its CLI (subprocess) instead of the Python API. "
+             "Use this if in-process import causes conflicts.",
+    )
+    parser.add_argument(
+        "--opensora-seed",
+        type=int,
+        default=42,
+        help="Random seed for Open-Sora generation (default: 42).",
+    )
+
     args = parser.parse_args()
 
     # ── 1. Load script ────────────────────────────────────────────────────────
@@ -334,12 +380,13 @@ def main():
         _run_cartoon_fallback(args, data, char_names, dialogue)
         return
 
-    # ── 3. Scene image mode vs two-portrait mode ──────────────────────────────
+    # ── 3. Scene image mode vs portrait mode (SD or Open-Sora) ──────────────────
     from tts            import text_to_speech
     from wav2lip_runner import run_wav2lip
     from lip_sync       import get_audio_duration
 
-    use_scene = args.scene_image and os.path.isfile(args.scene_image)
+    use_scene    = args.scene_image and os.path.isfile(args.scene_image)
+    use_opensora = getattr(args, "use_opensora", False)
 
     if use_scene:
         # ── Single-scene mode: one photo with both people ─────────────────────
@@ -349,9 +396,96 @@ def main():
             args.scene_image, char_names,
             args.width, args.height, args.fps,
         )
-        ordered_faces = None   # not used; face crops come from the scene
+        ordered_faces       = None   # not used; face crops come from the scene
+        opensora_char_clips = None
+
+    elif use_opensora:
+        # ── Open-Sora mode: generate animated character clips ─────────────────
+        banner("Generating character videos with Open-Sora")
+        from opensora_generator import (
+            is_opensora_ready,
+            generate_character_video,
+            generate_background_video,
+            extract_still_from_video,
+        )
+
+        if not is_opensora_ready():
+            sys.exit(
+                "[Error] Open-Sora is not installed.\n"
+                "        Run:  python setup_opensora.py\n"
+                "        Then re-run with --use-opensora."
+            )
+
+        os.makedirs(args.faces_dir, exist_ok=True)
+        opensora_char_clips = {}   # {name: path to looping .mp4}
+        ordered_faces       = []   # still frames for Wav2Lip
+
+        facings = ["right", "left"]   # char 0 faces right, char 1 faces left
+        for idx, name in enumerate(char_names):
+            info   = char_data.get(name, {})
+            role   = info.get("role",   "professional")
+            gender = info.get("gender", "neutral")
+            safe   = name.lower().replace(" ", "_")
+
+            clip_path  = os.path.join(args.faces_dir, f"opensora_{safe}.mp4")
+            still_path = os.path.join(args.faces_dir, f"face_{safe}.png")
+
+            # Re-use existing clip unless --regen-faces
+            if os.path.isfile(clip_path) and not args.regen_faces:
+                print(f"  ✓ {name} → {clip_path}  (existing Open-Sora clip)")
+            else:
+                print(f"  [OpenSora] Generating portrait clip for '{name}' …")
+                generate_character_video(
+                    character_name = name,
+                    role           = role,
+                    gender         = gender,
+                    facing         = facings[idx % 2],
+                    output_path    = clip_path,
+                    num_frames     = args.opensora_frames,
+                    fps            = 24,
+                    resolution     = args.opensora_resolution,
+                    seed           = args.opensora_seed + idx,
+                    use_cli        = args.opensora_cli,
+                )
+
+            opensora_char_clips[name] = clip_path
+
+            # Extract a still frame for Wav2Lip face input
+            if not os.path.isfile(still_path) or args.regen_faces:
+                still = extract_still_from_video(clip_path, frame_idx=10)
+                still.save(still_path)
+                print(f"  ✓ Still extracted → {still_path}")
+            ordered_faces.append(still_path)
+
+        # Optionally generate an animated background
+        if args.opensora_bg:
+            bg_path = os.path.join(args.faces_dir, "opensora_background.mp4")
+            if not os.path.isfile(bg_path) or args.regen_room:
+                print("  [OpenSora] Generating background clip …")
+                scene_desc = data.get("scene", "modern office lounge, warm lighting")
+                generate_background_video(
+                    scene_description = scene_desc,
+                    output_path       = bg_path,
+                    num_frames        = 97,
+                    fps               = 24,
+                    resolution        = args.opensora_resolution,
+                    seed              = args.opensora_seed,
+                    use_cli           = args.opensora_cli,
+                )
+            print(f"  ✓ Background → {bg_path}")
+        else:
+            bg_path = None
+
+        from video_composer import VideoComposer
+        composer = VideoComposer(
+            args.width, args.height, args.fps,
+            char_names          = char_names,
+            opensora_char_clips = opensora_char_clips,
+            background_video    = bg_path,
+        )
+
     else:
-        # ── Two-portrait mode: separate SD faces + split-screen ───────────────
+        # ── Two-portrait mode: Stable Diffusion faces + split-screen ──────────
         banner("Generating / loading face images (Stable Diffusion)")
         face_paths    = _generate_missing_faces(
             char_names, char_data, args.faces_dir,
@@ -359,7 +493,8 @@ def main():
             regen=args.regen_faces,
             width=512, height=512,
         )
-        ordered_faces = [face_paths[n] for n in char_names]
+        ordered_faces       = [face_paths[n] for n in char_names]
+        opensora_char_clips = None
 
         from video_composer import VideoComposer
         composer = VideoComposer(

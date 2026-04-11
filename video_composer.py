@@ -1565,10 +1565,16 @@ class VideoComposer:
         width: int = 1280,
         height: int = 720,
         fps: int = 25,
-        room_bg_path: str | None = None,       # kept for API compat (unused)
-        room_bg_image: Image.Image | None = None,   # kept for API compat (unused)
-        char_body_paths: dict | None = None,   # kept for API compat (unused)
-        char_names: list[str] | None = None,   # display names for name tags
+        room_bg_path: str | None = None,
+        room_bg_image: Image.Image | None = None,
+        char_body_paths: dict | None = None,
+        char_names: list[str] | None = None,
+        # Open-Sora integration ─────────────────────────────────────────────
+        opensora_char_clips: dict | None = None,
+        # {char_name: path_to_mp4} — if supplied, frames from this clip are
+        # used as the listener's animated portrait instead of the static PNG.
+        background_video: str | None = None,
+        # Path to an Open-Sora generated background MP4 (looped).
     ):
         self.width       = width
         self.height      = height
@@ -1578,28 +1584,53 @@ class VideoComposer:
         self.sub_h       = height - self.char_h
 
         # ── Split-screen layout ───────────────────────────────────────────────
-        # Each character owns exactly half the horizontal space.
         self.panel_w = width // 2
-
-        # Portrait fills ~88 % of panel width (natural, not tiny)
-        # Taller aspect ratio (1.45) gives a head-and-shoulders bust crop
         self.fw = int(self.panel_w * 0.88)
         self.fh = int(self.fw * 1.45)
-
-        # Panel x-offsets (left edge of each panel)
         self.panel_x = [0, self.panel_w]
 
-        # Character centres: horizontal = panel mid, vertical = upper half
         cx_l = self.panel_w // 2
         cx_r = self.panel_w + self.panel_w // 2
-        cy   = int(self.char_h * 0.46)   # head sits in upper portion
+        cy   = int(self.char_h * 0.46)
         self.centres = [(cx_l, cy), (cx_r, cy)]
 
-        # Pre-render studio panel backgrounds (expensive; done once)
+        # Pre-render studio panel backgrounds
         self._panel_bgs = [
             _make_panel_bg(self.panel_w, self.char_h, 0),
             _make_panel_bg(self.panel_w, self.char_h, 1),
         ]
+
+        # ── Open-Sora animated clips ──────────────────────────────────────────
+        # Load each character's Open-Sora video into memory as a MoviePy clip
+        # so individual frames can be fetched cheaply per-frame.
+        self._opensora_clips: dict = {}   # {char_name: VideoFileClip}
+        if opensora_char_clips:
+            try:
+                try:
+                    from moviepy import VideoFileClip  # v2
+                except ImportError:
+                    from moviepy.editor import VideoFileClip  # v1
+                for name, path in opensora_char_clips.items():
+                    if path and os.path.isfile(path):
+                        self._opensora_clips[name] = VideoFileClip(path)
+                        print(f"  [OpenSora] Loaded listener clip for '{name}'  "
+                              f"({self._opensora_clips[name].duration:.1f}s)")
+            except Exception as e:
+                print(f"  [OpenSora] Warning: could not load character clips: {e}")
+
+        # ── Open-Sora background video ────────────────────────────────────────
+        self._bg_clip = None
+        if background_video and os.path.isfile(background_video):
+            try:
+                try:
+                    from moviepy import VideoFileClip  # v2
+                except ImportError:
+                    from moviepy.editor import VideoFileClip  # v1
+                self._bg_clip = VideoFileClip(background_video)
+                print(f"  [OpenSora] Loaded background clip  "
+                      f"({self._bg_clip.duration:.1f}s)")
+            except Exception as e:
+                print(f"  [OpenSora] Warning: could not load background: {e}")
 
     # ── build one composite PIL image (room + both faces + animation) ─────────
 
@@ -1659,15 +1690,34 @@ class VideoComposer:
                 face_img = Image.fromarray(speaker_frame).resize((sw, sh), Image.LANCZOS)
                 _blend_panel_face(canvas, face_img, px0, cy + sdy, sw, sh)
             else:
-                # Listener: nod (y-position shift) + brightness pulse + glow
-                nod_dy           = _listener_nod(t, char_idx, emotion=emotion)
-                l_face, ldx, ldy = _animate_face(
-                    listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
-                )
+                # ── Listener animation ─────────────────────────────────────────
+                # Priority: Open-Sora clip (real video) > static PNG + nod anim
+                listener_name = (self.char_names[char_idx]
+                                 if char_idx < len(self.char_names)
+                                 else None)
+                os_clip = self._opensora_clips.get(listener_name) if listener_name else None
+
                 ldx2, ldy2 = _sway_offset(t, char_idx, is_speaking=False, emotion=emotion)
-                # Subtle brightness pulse — removes the "frozen" look
-                l_face = _listening_brightness(l_face, t, char_idx)
-                face_cy = cy + ldy2 + nod_dy
+
+                if os_clip is not None:
+                    # ── Open-Sora mode: pull the live video frame ─────────────
+                    # Loop the clip by wrapping time around its duration
+                    clip_t   = t % os_clip.duration
+                    os_frame = os_clip.get_frame(clip_t)          # numpy H×W×3
+                    l_face   = Image.fromarray(os_frame.astype("uint8"))
+                    l_face   = l_face.resize((self.fw, self.fh), Image.LANCZOS)
+                    # Brightness pulse still applied for subtle "alive" feel
+                    l_face   = _listening_brightness(l_face, t, char_idx)
+                    face_cy  = cy + ldy2
+                else:
+                    # ── Static PNG mode: nod + brightness pulse ────────────────
+                    nod_dy           = _listener_nod(t, char_idx, emotion=emotion)
+                    l_face, ldx, ldy = _animate_face(
+                        listener_face, self.fw, self.fh, t, char_idx, is_speaking=False
+                    )
+                    l_face  = _listening_brightness(l_face, t, char_idx)
+                    face_cy = cy + ldy2 + nod_dy
+
                 _blend_panel_face(canvas, l_face, px0, face_cy,
                                   l_face.width, l_face.height)
                 # Soft attention glow around the listener's head
