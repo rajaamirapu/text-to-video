@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from typing import Sequence
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -53,27 +53,42 @@ class CharacterRenderer:
         self.position = position
 
         # ── resolve appearance ───────────────────────────────────────────────
-        if appearance:
-            self.skin   = _rgb(appearance.get("skin_rgb",  [255, 220, 185]))
-            self.hair   = _rgb(appearance.get("hair_rgb",  [80,  50,  20]))
-            self.eye    = _rgb(appearance.get("eye_rgb",   [70, 130, 180]))
-            self.shirt  = _rgb(appearance.get("shirt_rgb", [70, 130, 180]))
-            self.hair_style = appearance.get("hair_style", "medium")
-            self.gender     = appearance.get("gender", "neutral")
-        elif position == "left":
-            self.skin   = (255, 220, 185)
-            self.hair   = (80, 50, 20)
-            self.eye    = (70, 130, 180)
-            self.shirt  = (50, 100, 160)
-            self.hair_style = "medium"
-            self.gender     = "female"
+        # Position-based defaults that actually differ by gender, so that e.g.
+        # Alice (left / female) does not render identically to Bob (right / male).
+        if position == "left":
+            defaults = {
+                "skin_rgb":   [252, 220, 195],
+                "hair_rgb":   [120, 60, 30],
+                "eye_rgb":    [70, 130, 180],
+                "shirt_rgb":  [180, 80, 110],
+                "hair_style": "long",
+                "gender":     "female",
+            }
         else:
-            self.skin   = (200, 160, 120)
-            self.hair   = (30, 20, 10)
-            self.eye    = (60, 40, 20)
-            self.shirt  = (90, 55, 20)
-            self.hair_style = "short"
-            self.gender     = "male"
+            defaults = {
+                "skin_rgb":   [220, 180, 140],
+                "hair_rgb":   [45, 30, 20],
+                "eye_rgb":    [60, 40, 20],
+                "shirt_rgb":  [70, 90, 160],
+                "hair_style": "short",
+                "gender":     "male",
+            }
+        if appearance:
+            # caller-supplied fields override the position defaults
+            defaults = {**defaults, **appearance}
+
+        self.skin       = _rgb(defaults["skin_rgb"])
+        self.hair       = _rgb(defaults["hair_rgb"])
+        self.eye        = _rgb(defaults["eye_rgb"])
+        self.shirt      = _rgb(defaults["shirt_rgb"])
+        self.hair_style = defaults["hair_style"]
+        self.gender     = defaults["gender"]
+
+        # If gender=female but the caller (or default) picked a neutral
+        # hairstyle, upgrade to 'long' so the female portrait actually reads
+        # as female. Callers can still force 'short' explicitly.
+        if self.gender == "female" and self.hair_style == "medium":
+            self.hair_style = "long"
 
         # derived colours
         self.lip_color = (
@@ -179,24 +194,46 @@ class CharacterRenderer:
                 draw.polygon(pts, fill=self.hair)
 
     def _draw_head(self, draw, cx, cy, r):
-        """Skin-coloured face ellipse."""
-        draw.ellipse(
-            [cx - r,           cy - int(r * 1.12),
-             cx + r,           cy + int(r * 0.92)],
-            fill=self.skin,
-        )
-        # Very subtle side shading
-        shading = _darken(self.skin, 18)
-        for side in (-1, 1):
-            for i in range(4):
-                x0 = cx + side * int(r * (0.62 + i * 0.08))
-                x1 = cx + side * r
-                if side == -1:
-                    x0, x1 = x1, cx + side * int(r * (0.62 + i * 0.08))
-                draw.rectangle(
-                    [x0, cy - int(r * 1.12), x1, cy + int(r * 0.92)],
-                    fill=shading + (10,) if False else shading,
-                )
+        """Skin-coloured face ellipse with clipped soft side-shading.
+
+        The previous implementation drew four full-height rectangles on each
+        side of the face for "subtle side shading". Because the head is an
+        ellipse (narrow at the top and bottom), those rectangles protruded
+        past the face boundary and were clearly visible as rectangular blocks
+        flanking every character. This version draws the shading into a
+        separate RGBA layer and composites it through an ellipse mask so it
+        can never bleed outside the face.
+        """
+        face_box = [cx - r, cy - int(r * 1.12), cx + r, cy + int(r * 0.92)]
+        draw.ellipse(face_box, fill=self.skin)
+
+        img = getattr(draw, "_image", None)
+        if img is None or img.mode not in ("RGB", "RGBA"):
+            return
+
+        shade = _darken(self.skin, 14)
+        fw = face_box[2] - face_box[0]
+        fh = face_box[3] - face_box[1]
+        if fw <= 0 or fh <= 0:
+            return
+
+        layer = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        band = max(2, int(fw * 0.22))
+        ld.rectangle([0, 0, band, fh], fill=(*shade, 110))
+        ld.rectangle([fw - band, 0, fw, fh], fill=(*shade, 110))
+
+        mask = Image.new("L", (fw, fh), 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, fw - 1, fh - 1], fill=255)
+
+        shading_img = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
+        shading_img.paste(layer, (0, 0), mask)
+
+        dst_xy = (face_box[0], face_box[1])
+        if img.mode == "RGB":
+            img.paste(shading_img, dst_xy, shading_img)
+        else:
+            img.alpha_composite(shading_img, dst_xy)
 
     def _draw_hair_front(self, draw, cx, cy, r):
         """Hairline arc sitting on top of the face."""
@@ -269,6 +306,18 @@ class CharacterRenderer:
                 width=2,
             )
 
+            # Eyelashes — a small visual cue so female portraits read as
+            # female even without explicit appearance overrides.
+            if self.gender == "female":
+                lash_col = (20, 15, 12)
+                for k in (-2, -1, 0, 1, 2):
+                    base_x = ex + int(k * ew * 0.30)
+                    base_y = eye_y - eh
+                    tip_x  = ex + int(k * ew * 0.36)
+                    tip_y  = base_y - max(2, int(eh * 0.45))
+                    draw.line([(base_x, base_y), (tip_x, tip_y)],
+                              fill=lash_col, width=2)
+
     def _draw_nose(self, draw, cx, cy, r):
         nose_cy = cy + int(r * 0.10)
         nw      = int(r * 0.09)
@@ -297,70 +346,75 @@ class CharacterRenderer:
                 fill=lc,
                 width=3,
             )
-        else:
-            mh = max(5, int(r * 0.30 * mouth_opening))
+            return
 
-            # ── dark mouth cavity ─────────────────────────────────────────
-            draw.ellipse(
-                [cx - mw, mouth_cy - mh, cx + mw, mouth_cy + mh],
-                fill=(35, 12, 12),
+        mh = max(5, int(r * 0.30 * mouth_opening))
+
+        # ── dark mouth cavity ─────────────────────────────────────────────
+        draw.ellipse(
+            [cx - mw, mouth_cy - mh, cx + mw, mouth_cy + mh],
+            fill=(35, 12, 12),
+        )
+
+        # ── upper teeth (kept inside the mouth cavity width) ──────────────
+        teeth_inset = int(mw * 0.84)
+        teeth_h     = max(3, int(mh * 0.52))
+        teeth_left  = cx - teeth_inset
+        teeth_right = cx + teeth_inset
+        draw.rectangle(
+            [teeth_left, mouth_cy - mh, teeth_right, mouth_cy - mh + teeth_h],
+            fill=(242, 240, 235),
+        )
+        # Vertical tooth dividers, evenly spaced and always inside the teeth rect.
+        n_dividers  = 5
+        band_width  = teeth_right - teeth_left
+        for i in range(1, n_dividers + 1):
+            tx = teeth_left + int(band_width * i / (n_dividers + 1))
+            draw.line(
+                [(tx, mouth_cy - mh + 1), (tx, mouth_cy - mh + teeth_h - 1)],
+                fill=(200, 198, 193),
+                width=1,
             )
 
-            # ── upper teeth ───────────────────────────────────────────────
-            teeth_h = max(3, int(mh * 0.52))
+        # ── lower teeth (visible when wide open) ──────────────────────────
+        if mouth_opening > 0.45:
+            lo_h = max(2, int(teeth_h * 0.65))
             draw.rectangle(
-                [cx - int(mw * 0.84), mouth_cy - mh,
-                 cx + int(mw * 0.84), mouth_cy - mh + teeth_h],
-                fill=(242, 240, 235),
+                [cx - int(mw * 0.72), mouth_cy + mh - lo_h,
+                 cx + int(mw * 0.72), mouth_cy + mh],
+                fill=(228, 226, 220),
             )
-            # vertical tooth dividers
-            for i in range(-2, 3):
-                tx = cx + i * int(mw * 0.28)
-                draw.line(
-                    [(tx, mouth_cy - mh), (tx, mouth_cy - mh + teeth_h)],
-                    fill=(200, 198, 193),
-                    width=1,
-                )
 
-            # ── lower teeth (visible when wide open) ─────────────────────
-            if mouth_opening > 0.45:
-                lo_h = max(2, int(teeth_h * 0.65))
-                draw.rectangle(
-                    [cx - int(mw * 0.72), mouth_cy + mh - lo_h,
-                     cx + int(mw * 0.72), mouth_cy + mh],
-                    fill=(228, 226, 220),
-                )
+        # ── upper lip: a single thin curve hugging the top of the cavity ─
+        draw.arc(
+            [cx - mw - 2, mouth_cy - mh - int(r * 0.04),
+             cx + mw + 2, mouth_cy - mh + int(r * 0.04)],
+            start=0, end=180,
+            fill=lc,
+            width=3,
+        )
 
-            # ── upper lip ─────────────────────────────────────────────────
-            draw.arc(
-                [cx - mw - 2, mouth_cy - mh - int(r * 0.05),
-                 cx + mw + 2, mouth_cy - mh + int(r * 0.06)],
-                start=0, end=180,
-                fill=lc,
-                width=3,
-            )
-            # cupid's bow (two small arcs)
-            half = mw // 2
-            for side in (-1, 1):
-                draw.arc(
-                    [cx + side * half - half // 2,
-                     mouth_cy - mh - int(r * 0.08),
-                     cx + side * half + half // 2,
-                     mouth_cy - mh - int(r * 0.01)],
-                    start=210 if side == -1 else 330,
-                    end=330   if side == -1 else 210 + 180,
-                    fill=_darken(lc, 15),
-                    width=2,
-                )
+        # ── cupid's bow: a small, symmetric dip centred above the lip ────
+        # The previous implementation used a mismatched pair of arc angles
+        # (one side ended at 390° / went the wrong way around the ellipse),
+        # so the right half of the bow was always drawn incorrectly. This
+        # replacement is two mirror-image line segments that can't bleed
+        # outside the lip.
+        bow_half = max(2, int(mw * 0.22))
+        bow_top  = mouth_cy - mh - int(r * 0.07)
+        bow_dip  = mouth_cy - mh - int(r * 0.01)
+        bow_col  = _darken(lc, 20)
+        draw.line([(cx - bow_half, bow_top), (cx, bow_dip)], fill=bow_col, width=2)
+        draw.line([(cx, bow_dip), (cx + bow_half, bow_top)], fill=bow_col, width=2)
 
-            # ── lower lip ─────────────────────────────────────────────────
-            draw.arc(
-                [cx - mw, mouth_cy + mh - int(r * 0.06),
-                 cx + mw, mouth_cy + mh + int(r * 0.05)],
-                start=180, end=360,
-                fill=lc_lo,
-                width=4,
-            )
+        # ── lower lip ─────────────────────────────────────────────────────
+        draw.arc(
+            [cx - mw, mouth_cy + mh - int(r * 0.06),
+             cx + mw, mouth_cy + mh + int(r * 0.05)],
+            start=180, end=360,
+            fill=lc_lo,
+            width=4,
+        )
 
     def _draw_sound_bars(self, draw, cx, cy, amplitude: float):
         """Animated equaliser bars beneath the active speaker."""
