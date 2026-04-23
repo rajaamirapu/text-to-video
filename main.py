@@ -614,15 +614,31 @@ def _run_cartoon_fallback(args, data, char_names, dialogue):
     except ImportError:
         from moviepy import VideoClip, AudioFileClip, concatenate_videoclips          # v2
 
-    DEFAULT_APPEARANCES = [
-        {"skin_rgb": [235, 200, 170], "hair_rgb": [60, 40, 20],  "hair_style": "short"},
-        {"skin_rgb": [200, 165, 130], "hair_rgb": [140, 90, 50], "hair_style": "medium"},
-    ]
+    # Gender-keyed defaults so female characters don't render identically to
+    # male ones, and so that the `gender` field from the input JSON actually
+    # reaches the renderer.
+    DEFAULT_APPEARANCES = {
+        "female": {
+            "skin_rgb":   [252, 220, 195],
+            "hair_rgb":   [120, 60, 30],
+            "shirt_rgb":  [180, 80, 110],
+            "hair_style": "long",
+            "gender":     "female",
+        },
+        "male": {
+            "skin_rgb":   [220, 180, 140],
+            "hair_rgb":   [45, 30, 20],
+            "shirt_rgb":  [70, 90, 160],
+            "hair_style": "short",
+            "gender":     "male",
+        },
+    }
 
     renderers = []
     for idx, name in enumerate(char_names):
-        info = data["characters"].get(name, {})
-        app  = DEFAULT_APPEARANCES[idx % len(DEFAULT_APPEARANCES)]
+        info   = data["characters"].get(name, {})
+        gender = info.get("gender", "female" if idx == 0 else "male")
+        app    = {**DEFAULT_APPEARANCES[gender], **info}
         renderers.append(CharacterRenderer(name, app, ["left", "right"][idx]))
 
     from video_composer import _subtitle_img  # noqa: F401

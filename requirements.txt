@@ -5,8 +5,12 @@ numpy>=1.26.0,<2.0
 requests>=2.31.0
 
 # ── Audio / TTS ────────────────────────────────────────────────────────────────
-edge-tts>=6.1.9           # Microsoft neural TTS — natural male voices (primary)
-pyttsx3>=2.90             # offline TTS fallback
+# Piper is fully open-source (Apache-2.0), runs offline on CPU via onnxruntime,
+# and downloads lightweight ONNX voice models on first use. It is the primary
+# engine; edge-tts and pyttsx3 remain as fallbacks for resilience.
+piper-tts>=1.2.0          # open-source neural TTS — primary
+edge-tts>=6.1.9           # Microsoft neural TTS — network fallback
+pyttsx3>=2.90             # offline system-voice fallback
 soundfile>=0.12.1         # audio I/O (primary lip-sync signal source)
 
 # ── Lip-sync signal processing (optional enhancements) ────────────────────────
